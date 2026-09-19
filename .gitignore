@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Dados sao artefatos do pipeline, nao versionados.
+data/raw/*
+data/staging/*
+data/mart/*
+!data/raw/.gitkeep
+!data/staging/.gitkeep
+!data/mart/.gitkeep
+
+# O grafico do README fica versionado de proposito: sem ele a imagem quebra
+# na pagina do repositorio. E regenerado por scripts/gerar_grafico.py.

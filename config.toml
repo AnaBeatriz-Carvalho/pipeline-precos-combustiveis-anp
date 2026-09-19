@@ -1,0 +1,110 @@
+# Configuracao do pipeline ETL de precos de combustiveis da ANP.
+# Nada aqui deve ser repetido dentro do codigo.
+
+[fonte]
+# A ANP nao expoe API REST. Publica uma planilha cumulativa que e sobrescrita
+# a cada semana: cada coleta traz a serie historica inteira, nao um incremento.
+url = "https://www.gov.br/anp/pt-br/assuntos/precos-e-defesa-da-concorrencia/precos/precos-revenda-e-de-distribuicao-combustiveis/shlp/semanal/semanal-estados-desde-2013.xlsx"
+nome_base = "semanal-estados"
+timeout_conexao_segundos = 30
+timeout_leitura_segundos = 180
+
+[download]
+max_tentativas = 5
+backoff_inicial_segundos = 2.0
+backoff_fator = 2.0
+backoff_maximo_segundos = 60.0
+user_agent = "pipeline-precos-combustiveis-anp/1.0 (portfolio; +https://github.com)"
+# Guarda contra o gov.br devolver uma pagina de erro com HTTP 200.
+tamanho_minimo_bytes = 1000000
+
+[caminhos]
+raw = "data/raw"
+staging = "data/staging"
+mart_db = "data/mart/anp.duckdb"
+manifesto_raw = "data/raw/_manifesto.jsonl"
+graficos = "graficos"
+
+[extracao]
+# Linhas 1-17 da planilha sao cabecalho institucional e notas de rodape da ANP.
+# O cabecalho real das colunas esta na linha 18 (1-indexed).
+aba_indice = 0
+linha_cabecalho = 18
+# Se este conjunto nao bater exatamente com o arquivo, o pipeline falha.
+colunas_esperadas = [
+  "DATA INICIAL",
+  "DATA FINAL",
+  "REGIÃO",
+  "ESTADO",
+  "PRODUTO",
+  "NÚMERO DE POSTOS PESQUISADOS",
+  "UNIDADE DE MEDIDA",
+  "PREÇO MÉDIO REVENDA",
+  "DESVIO PADRÃO REVENDA",
+  "PREÇO MÍNIMO REVENDA",
+  "PREÇO MÁXIMO REVENDA",
+  "MARGEM MÉDIA REVENDA",
+  "COEF DE VARIAÇÃO REVENDA",
+  "PREÇO MÉDIO DISTRIBUIÇÃO",
+  "DESVIO PADRÃO DISTRIBUIÇÃO",
+  "PREÇO MÍNIMO DISTRIBUIÇÃO",
+  "PREÇO MÁXIMO DISTRIBUIÇÃO",
+  "COEF DE VARIAÇÃO DISTRIBUIÇÃO",
+]
+# A ANP usa "-" como marcador de ausencia, nao celula vazia.
+marcadores_nulos = ["-", "", "n/a"]
+
+[escopo]
+# "Gasolina C" nao existe como rotulo na fonte: o equivalente e GASOLINA COMUM.
+# GASOLINA ADITIVADA e um produto separado e esta fora da v1.
+unidade_esperada = "R$/l"
+
+[escopo.produtos]
+"GASOLINA COMUM" = "GASOLINA C"
+"ETANOL HIDRATADO" = "ETANOL HIDRATADO"
+
+[qualidade]
+preco_medio_minimo = 1.0
+preco_medio_maximo = 15.0
+ufs_esperadas = 27
+variacao_semanal_alerta = 0.15
+# UFs que podem faltar legitimamente por produto: a ANP nao pesquisa etanol
+# hidratado no Amapa em boa parte das semanas. Ausencia fora desta lista e erro.
+[qualidade.ufs_ausentes_toleradas]
+"GASOLINA C" = []
+"ETANOL HIDRATADO" = ["AP"]
+
+# Nome por extenso e sem acento e a unica identificacao de estado na fonte.
+[ufs]
+"ACRE" = "AC"
+"ALAGOAS" = "AL"
+"AMAPA" = "AP"
+"AMAZONAS" = "AM"
+"BAHIA" = "BA"
+"CEARA" = "CE"
+"DISTRITO FEDERAL" = "DF"
+"ESPIRITO SANTO" = "ES"
+"GOIAS" = "GO"
+"MARANHAO" = "MA"
+"MATO GROSSO" = "MT"
+"MATO GROSSO DO SUL" = "MS"
+"MINAS GERAIS" = "MG"
+"PARA" = "PA"
+"PARAIBA" = "PB"
+"PARANA" = "PR"
+"PERNAMBUCO" = "PE"
+"PIAUI" = "PI"
+"RIO DE JANEIRO" = "RJ"
+"RIO GRANDE DO NORTE" = "RN"
+"RIO GRANDE DO SUL" = "RS"
+"RONDONIA" = "RO"
+"RORAIMA" = "RR"
+"SANTA CATARINA" = "SC"
+"SAO PAULO" = "SP"
+"SERGIPE" = "SE"
+"TOCANTINS" = "TO"
+
+[grafico]
+uf_destaque = "SE"
+produto = "GASOLINA C"
+janela_meses = 24
