@@ -1,0 +1,89 @@
+name: Pipeline semanal ANP
+
+on:
+  schedule:
+    # Toda quarta-feira as 12:00 UTC (09:00 em Brasilia). A ANP costuma
+    # publicar a planilha da semana entre segunda e terca.
+    - cron: "0 12 * * 3"
+  workflow_dispatch:
+    inputs:
+      semana:
+        description: "Semana a validar (AAAA-MM-DD). Vazio = a mais recente."
+        required: false
+        type: string
+
+# Duas execucoes simultaneas escreveriam no mesmo mart.
+concurrency:
+  group: pipeline-anp
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # O projeto nao e instalado como pacote; os modulos vivem em src/.
+  PYTHONPATH: src
+
+jobs:
+  etl:
+    name: Extrair, transformar, carregar e validar
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Testes automatizados
+        run: pytest -v
+
+      # Full refresh: a planilha da ANP e cumulativa e traz a serie inteira,
+      # entao o runner efemero reconstroi tudo do zero a cada semana e nao ha
+      # estado a preservar entre execucoes.
+      - name: Executar pipeline
+        id: pipeline
+        env:
+          SEMANA: ${{ inputs.semana }}
+        run: |
+          set -o pipefail
+          if [ -n "$SEMANA" ]; then
+            python -m anp.pipeline --semana "$SEMANA" 2>&1 | tee execucao.log
+          else
+            python -m anp.pipeline 2>&1 | tee execucao.log
+          fi
+
+      - name: Gerar grafico
+        if: success()
+        run: python scripts/gerar_grafico.py
+
+      - name: Resumo da execucao
+        if: always()
+        run: |
+          python scripts/resumo_execucao.py \
+            --log execucao.log \
+            --resultado "${{ steps.pipeline.outcome }}" \
+            --saida "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar artefatos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-anp-${{ github.run_number }}
+          path: |
+            execucao.log
+            data/mart/anp.duckdb
+            data/staging/precos_semanais.parquet
+            graficos/*.png
+          retention-days: 30
+          if-no-files-found: warn
