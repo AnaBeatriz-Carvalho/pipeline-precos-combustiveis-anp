@@ -140,6 +140,46 @@ automatizados, o pipeline e o gráfico; **qualquer teste de qualidade que falhe
 derruba o job**, e o motivo aparece como tabela no resumo da execução, sem
 precisar abrir o log. O banco, o Parquet, o gráfico e o log sobem como artefato.
 
+### Destino PostgreSQL (opcional)
+
+O padrão continua sendo o DuckDB. Para carregar no PostgreSQL:
+
+```bash
+cp .env.example .env        # preencha DATABASE_URL; o .env não é versionado
+# no config.toml: [destino] backend = "postgres"
+python -m anp.pipeline
+```
+
+O DDL fica em `sql/`, em arquivos numerados e idempotentes que são aplicados a
+cada conexão. Ficam em três schemas:
+
+| Tabela | Papel |
+|---|---|
+| `staging.precos_semanais` | pouso da carga, reescrita a cada execução |
+| `mart.fato_precos_semanais` | mesmo grão e PK do DuckDB, preços em `numeric` |
+| `controle.cargas` | uma linha por execução: sha256, arquivo, status, linhas, erro |
+
+No PostgreSQL, a carga passa por três passos, cada um numa função separada de
+`anp.carregar_postgres`:
+
+1. `carregar_staging`: registra a carga como `iniciada` e grava a staging.
+2. `validar`: roda os testes de qualidade **sobre a staging**. Se algum teste
+   bloqueante falhar, o mart não é tocado, a carga fica `falhou` com o motivo
+   em `erro` e a staging continua lá para inspeção.
+3. `promover`: faz o upsert da staging no mart e grava o status `concluida` ou
+   `concluida_com_avisos` na mesma transação.
+
+Os testes `@pytest.mark.postgres` são pulados quando não há `DATABASE_URL`.
+Quando a variável existe, eles criam um banco temporário no mesmo servidor e o
+removem ao final, sem tocar no banco configurado.
+
+> **Os dois backends ainda não se comportam igual.** No DuckDB a carga vai
+> direto para o mart e a qualidade roda depois, de modo que uma reprovação deixa
+> os dados no mart (o job falha, mas os dados ficam). No PostgreSQL, uma
+> reprovação nunca chega ao mart. O alinhamento dos dois backends fica para a
+> migração ao Airflow, quando `carregar_staging`, `validar` e `promover`
+> viram tasks.
+
 ## Decisões de projeto
 
 **Full refresh, não carga incremental.** A fonte é cumulativa: cada coleta traz
@@ -263,3 +303,14 @@ Três saltos entre semanas consecutivas, tratados pelo `LAG`:
   até esgotar o backoff antes de falhar — custa ~30 s quando a URL muda de vez.
 - Os testes de qualidade avaliam **a semana carregada**, não a série inteira.
   Uma anomalia antiga que entre numa revisão retroativa da ANP não é detectada.
+
+## Pendências
+
+- **Testes de qualidade em SQL no PostgreSQL.** Hoje, no backend PostgreSQL, a
+  staging é copiada para um DuckDB em memória e os testes de `anp.qualidade`
+  rodam lá, porque estão escritos no dialeto do DuckDB (`?`, `date_diff`,
+  alias dentro de `ORDER BY`). A ideia é reescrevê-los em SQL do PostgreSQL e
+  rodá-los direto sobre `staging.precos_semanais`, sem a cópia.
+- **Alinhar os backends na migração ao Airflow.** O DuckDB ainda carrega direto
+  no mart e valida depois. O alinhamento fica para quando `carregar_staging`,
+  `validar` e `promover` virarem tasks (ver *Destino PostgreSQL*).

@@ -6,7 +6,8 @@ rodar duas vezes com o mesmo staging nao duplica nenhuma linha, apenas
 reescreve as existentes com a data_ingestao mais recente.
 
 O destino vem de [destino] backend no config.toml. Este modulo implementa o
-DuckDB; a conexao com o PostgreSQL fica em anp.carregar_postgres.
+DuckDB e repassa o PostgreSQL para anp.carregar_postgres, onde a carga passa
+por staging e qualidade antes de chegar ao mart.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ import duckdb
 import pandas as pd
 
 from anp.config import Config
-from anp.erros import ErroPipeline
 from anp.log import obter_logger
 
 if TYPE_CHECKING:
@@ -96,9 +96,9 @@ def carregar(
     segunda execucao atualiza no lugar em vez de inserir de novo.
     """
     if _postgres(cfg):
-        raise ErroPipeline(
-            'A carga no PostgreSQL ainda nao esta disponivel: use destino.backend = "duckdb".'
-        )
+        from anp import carregar_postgres
+
+        return carregar_postgres.carregar(cfg, df_staging, conexao)
 
     propria = conexao is None
     con = conexao or conectar(cfg)
