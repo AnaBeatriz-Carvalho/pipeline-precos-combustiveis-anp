@@ -59,6 +59,9 @@ def executar(
     conexao = conectar(cfg)
     try:
         if cfg.backend == "postgres":
+            # O DDL e um passo explicito, uma vez por execucao: abrir a conexao
+            # nao o aplica (no DAG, e a task inicializar_banco).
+            carregar_postgres.aplicar_ddl(conexao)
             # Staging -> qualidade -> mart: o mart so muda se a qualidade aprovar.
             # Cada passo e uma funcao isolada, ligada as outras so pelo id_carga.
             id_carga = carregar_postgres.carregar_staging(cfg, df, conexao)

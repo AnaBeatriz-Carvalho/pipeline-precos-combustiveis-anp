@@ -53,6 +53,25 @@ def test_postgres_sem_database_url_falha_com_mensagem_acionavel(cfg, tmp_path, m
         conectar(cfg)
 
 
+def test_conectar_nao_aplica_ddl(cfg, monkeypatch):
+    """O DDL e um passo explicito (inicializar_banco), nao efeito de conectar."""
+    monkeypatch.setitem(cfg.dados["destino"], "backend", "postgres")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:s@host.invalido/anp")
+    aberturas = []
+    monkeypatch.setattr(
+        carregar_postgres.psycopg, "connect",
+        lambda url, **kw: aberturas.append((url, kw)) or object(),
+    )
+
+    def proibido(_conexao):
+        raise AssertionError("conectar nao deveria aplicar DDL")
+
+    monkeypatch.setattr(carregar_postgres, "aplicar_ddl", proibido)
+
+    conectar(cfg)
+    assert aberturas == [("postgresql://u:s@host.invalido/anp", {"autocommit": True})]
+
+
 # --- com PostgreSQL ---------------------------------------------------------
 
 @pytest.fixture(scope="session")
@@ -72,7 +91,11 @@ def url_banco_teste():
             f"Nao foi possivel criar o banco de teste {nome} no servidor de "
             f"DATABASE_URL (o usuario precisa de CREATEDB): {erro}"
         )
-    yield make_conninfo(base, dbname=nome)
+    url = make_conninfo(base, dbname=nome)
+    # Como no DAG, o DDL e aplicado uma vez, antes de qualquer carga.
+    with psycopg.connect(url, autocommit=True) as con:
+        carregar_postgres.aplicar_ddl(con)
+    yield url
     with psycopg.connect(base, autocommit=True) as admin:
         admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(nome)))
 
@@ -138,8 +161,12 @@ def _cargas(con) -> list[dict]:
 
 @pytest.mark.postgres
 def test_ddl_e_idempotente_e_mart_espelha_o_duckdb(con_pg):
-    carregar_postgres.aplicar_ddl(con_pg)
-    carregar_postgres.aplicar_ddl(con_pg)
+    aplicados = carregar_postgres.inicializar_banco()
+    assert carregar_postgres.inicializar_banco() == aplicados
+    assert aplicados == [
+        "001_schemas.sql", "002_mart_fato_precos_semanais.sql",
+        "003_controle_cargas.sql", "004_staging_precos_semanais.sql",
+    ]
 
     colunas = con_pg.execute(
         """

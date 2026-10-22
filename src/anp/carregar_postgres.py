@@ -17,7 +17,9 @@ resultados da qualidade entre validar e promover.
   gravado numa transacao separada.
 
 O mart so muda em promover. O DDL vive em sql/, em arquivos numerados e
-idempotentes, aplicados em ordem a cada conexao.
+idempotentes, e e aplicado por inicializar_banco, uma vez antes da carga: pela
+task inicializar_banco do DAG e no inicio de anp.pipeline.executar. Abrir uma
+conexao nao aplica DDL.
 
 A conexao trabalha em autocommit: cada bloco conexao.transaction() e entao uma
 transacao real (BEGIN/COMMIT), e nao um savepoint dentro de uma transacao
@@ -93,25 +95,38 @@ def url_conexao() -> str:
     return url
 
 
-def aplicar_ddl(conexao: psycopg.Connection) -> None:
-    """Executa, em ordem numerica, os arquivos de sql/. Todos sao idempotentes."""
+def aplicar_ddl(conexao: psycopg.Connection) -> list[str]:
+    """Executa, em ordem numerica, os arquivos de sql/. Todos sao idempotentes.
+
+    Devolve os nomes dos arquivos aplicados.
+    """
     arquivos = sorted(DIR_SQL.glob("[0-9][0-9][0-9]_*.sql"))
     if not arquivos:
         raise ErroPipeline(f"Nenhum arquivo de DDL encontrado em {DIR_SQL}.")
     with conexao.transaction():
         for arquivo in arquivos:
             conexao.execute(arquivo.read_text(encoding="utf-8"))
+    nomes = [arquivo.name for arquivo in arquivos]
+    log.info("ddl aplicado", extra={"evento": "ddl_ok", "arquivos": nomes})
+    return nomes
+
+
+def inicializar_banco() -> list[str]:
+    """Garante schemas e tabelas no banco de DATABASE_URL.
+
+    E o passo explicito de DDL: a task inicializar_banco do DAG e o inicio do
+    CLI no backend postgres. Devolve os arquivos de sql/ aplicados.
+    """
+    with psycopg.connect(url_conexao(), autocommit=True) as conexao:
+        return aplicar_ddl(conexao)
 
 
 def conectar(cfg: Config) -> psycopg.Connection:
-    """Abre a conexao com o PostgreSQL e garante schemas e tabelas."""
-    conexao = psycopg.connect(url_conexao(), autocommit=True)
-    try:
-        aplicar_ddl(conexao)
-    except Exception:
-        conexao.close()
-        raise
-    return conexao
+    """Abre a conexao com o PostgreSQL, em autocommit.
+
+    Nao aplica DDL: o banco ja deve ter passado por inicializar_banco.
+    """
+    return psycopg.connect(url_conexao(), autocommit=True)
 
 
 def _exigir_autocommit(conexao: psycopg.Connection) -> None:
@@ -438,7 +453,8 @@ def carregar(
 
     Mesmo contrato da carga no DuckDB: devolve o total de linhas carregadas e
     deixa a excecao seguir em caso de erro. Aqui, uma reprovacao na qualidade
-    tambem e erro (ErroQualidade), e o mart nao e alterado.
+    tambem e erro (ErroQualidade), e o mart nao e alterado. O banco ja deve ter
+    passado por inicializar_banco.
     """
     propria = conexao is None
     con = conexao or conectar(cfg)
