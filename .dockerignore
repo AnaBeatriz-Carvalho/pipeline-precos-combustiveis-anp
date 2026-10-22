@@ -1,0 +1,10 @@
+# Lista de permissao: so entra no contexto de build o que a imagem usa.
+# Em especial, .env, .venv e data/ nunca vao para a imagem.
+*
+!requirements.txt
+!config.toml
+!sql/
+!src/
+!dags/
+**/__pycache__
+**/*.pyc

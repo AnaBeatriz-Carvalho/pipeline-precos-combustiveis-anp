@@ -1,0 +1,179 @@
+# Airflow 3.3.2 com LocalExecutor, para rodar o DAG anp_precos_semanais.
+#
+# Base: docker-compose.yaml oficial do Airflow 3.3.2
+# (https://airflow.apache.org/docs/apache-airflow/3.3.2/docker-compose.yaml),
+# enxugado para LocalExecutor:
+#
+#   - sem Celery, Redis, worker e Flower: com LocalExecutor as tasks rodam como
+#     subprocessos do scheduler;
+#   - sem triggerer: ele so atende tasks deferrable, e o DAG nao tem nenhuma;
+#   - sem airflow-cli: comandos avulsos rodam com `docker compose exec`;
+#   - sem bind mounts de logs, config e plugins: logs ficam num volume nomeado
+#     e a configuracao vem toda de variaveis de ambiente.
+#
+# Servicos que o Airflow 3 exige:
+#
+#   postgres               banco de metadados do Airflow (database airflow) e,
+#                          num database separado, os dados do pipeline (anp)
+#   airflow-init           roda uma vez: migra o banco de metadados e cria o
+#                          usuario admin da interface
+#   airflow-apiserver      interface web, API REST e Execution API (as tasks
+#                          reportam estado por ela no Airflow 3)
+#   airflow-scheduler      agenda as execucoes e, com LocalExecutor, executa as
+#                          tasks
+#   airflow-dag-processor  le e serializa os arquivos de dags/; no Airflow 3 e
+#                          um processo separado e obrigatorio
+#
+# Limites de memoria (deploy.resources.limits), pensando no servidor de 8 GB:
+#   postgres 512M + apiserver 1G + scheduler 2G + dag-processor 768M
+#   + airflow-init 768M (so na subida) = 5 GB.
+#
+# Segredos vem do .env (veja .env.example). O Postgres nao publica porta no
+# host; para acessa-lo de fora, veja compose.override.example.yaml.
+---
+x-airflow-common:
+  &airflow-common
+  build: .
+  image: anp-airflow:3.3.2
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # Com 2 GB no scheduler, no maximo 4 tasks simultaneas; o DAG e linear e
+    # tem max_active_runs=1, entao na pratica roda uma por vez.
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?defina no .env}@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?defina no .env}
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/anp/dags
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?defina no .env}
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+  volumes:
+    # O DAG vem do repositorio, para editar sem rebuild. O codigo de src/anp
+    # vem da imagem: mudou src/, rode `docker compose build`.
+    - ./dags:/opt/anp/dags:ro
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina no .env}
+      POSTGRES_DB: postgres
+      # Lidas por docker/postgres/init/01-bancos.sh na primeira subida.
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?defina no .env}
+      ANP_DB_PASSWORD: ${ANP_DB_PASSWORD:?defina no .env}
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    environment:
+      <<: *airflow-common-env
+      # Um worker do uvicorn basta para uso local e cabe no limite de 1 GB.
+      AIRFLOW__API__WORKERS: "1"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    environment:
+      <<: *airflow-common-env
+      # So o scheduler executa tasks, entao so ele recebe a URL do banco anp.
+      DATABASE_URL: ${ANP_DATABASE_URL:?defina no .env}
+    volumes:
+      - ./dags:/opt/anp/dags:ro
+      - airflow-logs:/opt/airflow/logs
+      # raw e staging persistem entre tasks e entre execucoes.
+      - anp-data:/opt/anp/data
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  airflow-init:
+    <<: *airflow-common
+    # O entrypoint da imagem oficial migra o banco e cria o admin quando as
+    # variaveis _AIRFLOW_* estao ligadas, e depois roda o comando.
+    command: version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:?defina no .env}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?defina no .env}
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+volumes:
+  postgres-db-volume:
+  airflow-logs:
+  anp-data:

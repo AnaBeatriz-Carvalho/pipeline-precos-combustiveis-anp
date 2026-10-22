@@ -17,3 +17,7 @@ data/mart/*
 
 # O grafico do README fica versionado de proposito: sem ele a imagem quebra
 # na pagina do repositorio. E regenerado por scripts/gerar_grafico.py.
+
+# Override local do Compose (porta do Postgres); o modelo e
+# compose.override.example.yaml.
+compose.override.yaml
