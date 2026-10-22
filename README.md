@@ -150,8 +150,10 @@ cp .env.example .env        # preencha DATABASE_URL; o .env não é versionado
 python -m anp.pipeline
 ```
 
-O DDL fica em `sql/`, em arquivos numerados e idempotentes que são aplicados a
-cada conexão. Ficam em três schemas:
+O DDL fica em `sql/`, em arquivos numerados e idempotentes. Ele é aplicado por
+`carregar_postgres.inicializar_banco()`, uma vez antes da carga — no início do
+CLI e na task `inicializar_banco` do DAG —, e não ao abrir cada conexão. As
+tabelas ficam em três schemas:
 
 | Tabela | Papel |
 |---|---|
@@ -176,9 +178,96 @@ removem ao final, sem tocar no banco configurado.
 > **Os dois backends ainda não se comportam igual.** No DuckDB a carga vai
 > direto para o mart e a qualidade roda depois, de modo que uma reprovação deixa
 > os dados no mart (o job falha, mas os dados ficam). No PostgreSQL, uma
-> reprovação nunca chega ao mart. O alinhamento dos dois backends fica para a
-> migração ao Airflow, quando `carregar_staging`, `validar` e `promover`
-> viram tasks.
+> reprovação nunca chega ao mart. O DAG do Airflow usa sempre o PostgreSQL; o
+> DuckDB segue disponível só pelo CLI.
+
+### Airflow com Docker Compose
+
+O DAG `anp_precos_semanais` roda o pipeline no **Airflow 3.3.2** com
+LocalExecutor, gravando no PostgreSQL. Tudo do Airflow roda em containers:
+
+```
+inicializar_banco → extrair → transformar → carregar_staging → validar → promover
+```
+
+Cada task só chama a função correspondente de `src/anp`. Entre tasks passam
+apenas valores pequenos por XCom (caminho do arquivo, sha256, `id_carga`, resumo
+da qualidade); o DataFrame vai da transformação para a carga pelo Parquet do
+staging. Agenda: **quarta-feira, 12:00 UTC**, sem catchup, uma execução por vez.
+`extrair` tem 3 retries com backoff exponencial; uma reprovação em `validar` é
+definitiva e não tem retry.
+
+| Serviço | Papel | Limite de memória |
+|---|---|---|
+| `postgres` | PostgreSQL 16 com dois databases: `airflow` (metadados, usuário `airflow`) e `anp` (dados, usuário `anp`) | 512 MB |
+| `airflow-init` | migra os metadados e cria o admin; roda uma vez e sai | 768 MB |
+| `airflow-apiserver` | interface web e API, em http://localhost:8080 | 1 GB |
+| `airflow-scheduler` | agenda e, com LocalExecutor, executa as tasks | 2 GB |
+| `airflow-dag-processor` | lê os arquivos de `dags/` | 768 MB |
+
+> **No Windows, clone o repositório num caminho sem espaços** (por exemplo
+> `C:\dev\pipeline-precos-combustiveis-anp`, e não `C:\Users\Nome Sobrenome\...`).
+> Caminhos com espaço são fonte recorrente de erro em bind mounts e scripts do
+> Docker Desktop com WSL2.
+
+**Subir:**
+
+```bash
+cp .env.example .env     # preencha senhas, AIRFLOW_FERNET_KEY e AIRFLOW_JWT_SECRET
+docker compose up -d --build
+docker compose ps        # espere apiserver, scheduler e dag-processor "healthy"
+```
+
+Na primeira subida, `docker/postgres/init/01-bancos.sh` cria os dois databases e
+os usuários com as senhas do `.env`. Esse script só roda com o volume vazio:
+para trocar as senhas depois, altere-as no Postgres (`ALTER ROLE`) ou recrie o
+volume com `docker compose down -v`, o que **apaga os dados**.
+
+Mudou algo em `src/` ou `requirements.txt`? Rode `docker compose build`. O
+diretório `dags/` é montado do repositório e dispensa rebuild.
+
+**Interface:** http://localhost:8080, com `AIRFLOW_ADMIN_USER` e
+`AIRFLOW_ADMIN_PASSWORD` do `.env`.
+
+**Disparar o DAG:** o DAG nasce pausado. Na interface, ative o botão do
+`anp_precos_semanais` e use *Trigger*. Pelo terminal:
+
+```bash
+docker compose exec airflow-scheduler airflow dags unpause anp_precos_semanais
+docker compose exec airflow-scheduler airflow dags trigger anp_precos_semanais
+docker compose exec airflow-scheduler airflow dags list-runs anp_precos_semanais
+```
+
+**Consultar o banco** (o Postgres não publica porta no host):
+
+```bash
+docker compose exec postgres psql -U anp -d anp -c \
+  "SELECT status, linhas_carregadas, inicio FROM controle.cargas ORDER BY inicio DESC LIMIT 5"
+docker compose exec postgres psql -U anp -d anp -c \
+  "SELECT COUNT(*) FROM mart.fato_precos_semanais"
+```
+
+Para acessar de um cliente no Windows ou rodar os testes `@pytest.mark.postgres`
+contra esse Postgres, publique a porta com o override:
+
+```bash
+cp compose.override.example.yaml compose.override.yaml   # porta 127.0.0.1:15432
+docker compose up -d
+# no .env: DATABASE_URL=postgresql://anp:SENHA_ANP@127.0.0.1:15432/anp
+pytest
+```
+
+O `compose.override.yaml` está no `.gitignore`: sem a cópia, a porta não é
+publicada.
+
+**Teste do DAG.** `tests/test_dag.py` carrega o DagBag e confere a ordem das
+tasks; sem Airflow instalado (como no CI), ele é pulado. Para rodá-lo na imagem:
+
+```bash
+docker compose run --rm --no-deps -v ./tests:/opt/anp/tests \
+  -v ./pytest.ini:/opt/anp/pytest.ini -w /opt/anp airflow-scheduler \
+  python -m pytest tests/test_dag.py -v
+```
 
 ## Decisões de projeto
 
@@ -290,8 +379,8 @@ Três saltos entre semanas consecutivas, tratados pelo `LAG`:
 - Granularidade **estadual**. A média de uma UF esconde dispersão entre
   municípios e entre postos; `preco_min`, `preco_max` e `desvio_padrao` estão no
   mart justamente para dar essa noção.
-- **Dados por posto revendedor estão fora do escopo**, assim como Docker, dbt,
-  Airflow e dashboard.
+- **Dados por posto revendedor estão fora do escopo**, assim como dbt e
+  dashboard.
 - O número de postos pesquisados **varia por semana e por UF**, então a precisão
   da média não é uniforme entre estados.
 
@@ -311,6 +400,14 @@ Três saltos entre semanas consecutivas, tratados pelo `LAG`:
   rodam lá, porque estão escritos no dialeto do DuckDB (`?`, `date_diff`,
   alias dentro de `ORDER BY`). A ideia é reescrevê-los em SQL do PostgreSQL e
   rodá-los direto sobre `staging.precos_semanais`, sem a cópia.
-- **Alinhar os backends na migração ao Airflow.** O DuckDB ainda carrega direto
-  no mart e valida depois. O alinhamento fica para quando `carregar_staging`,
-  `validar` e `promover` virarem tasks (ver *Destino PostgreSQL*).
+- **Alinhar os backends.** O DAG do Airflow usa só o PostgreSQL, mas no CLI o
+  DuckDB ainda carrega direto no mart e valida depois (ver *Destino
+  PostgreSQL*).
+- **Alinhar o pandas do projeto com o do Airflow.** O `requirements.txt` fixa
+  pandas 2.2.2, e a imagem do Airflow 3.3.2 traz o 3.0.5, que o build
+  sobrescreve. Subir para o 3.x exige validar a transformação (tipos, `string`,
+  datas) contra a planilha real antes de trocar o pin.
+- **Separar o usuário de testes do usuário de runtime antes do deploy.** Hoje o
+  usuário `anp` tem `CREATEDB` porque os testes `@pytest.mark.postgres` criam um
+  banco temporário. No servidor, o pipeline deve rodar com um usuário sem esse
+  privilégio, e os testes com outro.
