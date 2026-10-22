@@ -27,6 +27,8 @@ _SECOES_OBRIGATORIAS = (
     "grafico",
 )
 
+BACKENDS = ("duckdb", "postgres")
+
 
 @dataclass(frozen=True)
 class Config:
@@ -53,6 +55,11 @@ class Config:
         """Mapa nome-do-estado-por-extenso -> sigla."""
         return dict(self.dados["ufs"])
 
+    @property
+    def backend(self) -> str:
+        """Destino da carga. Sem a secao [destino], o mart continua no DuckDB."""
+        return str(self.dados.get("destino", {}).get("backend", "duckdb"))
+
 
 def carregar_config(caminho: Path | str | None = None) -> Config:
     """Carrega o config.toml e valida que as secoes obrigatorias existem."""
@@ -77,6 +84,13 @@ def carregar_config(caminho: Path | str | None = None) -> Config:
         raise ErroPipeline(
             f"Config {alvo}: a secao [ufs] deve mapear as 27 unidades da "
             f"federacao, mas tem {len(dados['ufs'])}."
+        )
+
+    backend = dados.get("destino", {}).get("backend", "duckdb")
+    if backend not in BACKENDS:
+        raise ErroPipeline(
+            f"Config {alvo}: destino.backend = {backend!r} nao e suportado. "
+            f"Use um destes: {', '.join(BACKENDS)}."
         )
 
     return Config(dados=dados, raiz=RAIZ_PROJETO)

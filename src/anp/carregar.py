@@ -1,20 +1,28 @@
-"""Etapa 3: carga da tabela analitica no DuckDB.
+"""Etapa 3: carga da tabela analitica no DuckDB ou no PostgreSQL.
 
 A granularidade e semana x UF x produto, com chave primaria
 (data_inicio, uf, produto). A carga e um upsert dentro de uma transacao:
 rodar duas vezes com o mesmo staging nao duplica nenhuma linha, apenas
 reescreve as existentes com a data_ingestao mais recente.
+
+O destino vem de [destino] backend no config.toml. Este modulo implementa o
+DuckDB; a conexao com o PostgreSQL fica em anp.carregar_postgres.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import duckdb
 import pandas as pd
 
 from anp.config import Config
+from anp.erros import ErroPipeline
 from anp.log import obter_logger
+
+if TYPE_CHECKING:
+    import psycopg
 
 log = obter_logger("carga")
 
@@ -58,8 +66,18 @@ def criar_tabela(conexao: duckdb.DuckDBPyConnection) -> None:
     conexao.execute(_DDL)
 
 
-def conectar(cfg: Config) -> duckdb.DuckDBPyConnection:
+def _postgres(cfg: Config) -> bool:
+    return cfg.backend == "postgres"
+
+
+def conectar(cfg: Config) -> duckdb.DuckDBPyConnection | psycopg.Connection:
     """Abre o banco do mart, criando o diretorio e a tabela se preciso."""
+    if _postgres(cfg):
+        # Import tardio: carregar_postgres importa este modulo.
+        from anp import carregar_postgres
+
+        return carregar_postgres.conectar(cfg)
+
     caminho = cfg.caminho("mart_db")
     caminho.parent.mkdir(parents=True, exist_ok=True)
     conexao = duckdb.connect(str(caminho))
@@ -70,13 +88,18 @@ def conectar(cfg: Config) -> duckdb.DuckDBPyConnection:
 def carregar(
     cfg: Config,
     df_staging: pd.DataFrame,
-    conexao: duckdb.DuckDBPyConnection | None = None,
+    conexao: duckdb.DuckDBPyConnection | psycopg.Connection | None = None,
 ) -> int:
     """Faz o upsert do staging no mart e devolve o total de linhas afetadas.
 
     O ON CONFLICT sobre a chave primaria e o que garante idempotencia: a
     segunda execucao atualiza no lugar em vez de inserir de novo.
     """
+    if _postgres(cfg):
+        raise ErroPipeline(
+            'A carga no PostgreSQL ainda nao esta disponivel: use destino.backend = "duckdb".'
+        )
+
     propria = conexao is None
     con = conexao or conectar(cfg)
     try:

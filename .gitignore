@@ -4,6 +4,9 @@ __pycache__/
 venv/
 .pytest_cache/
 
+# Credenciais locais. O modelo versionado e o .env.example.
+.env
+
 # Dados sao artefatos do pipeline, nao versionados.
 data/raw/*
 data/staging/*
