@@ -12,9 +12,10 @@ resultados da qualidade entre validar e promover.
 - validar: roda os testes de qualidade sobre a staging, sem tocar no mart.
   Falha bloqueante marca a carga como "falhou", com o motivo em erro, e
   preserva a staging para inspecao.
-- promover: numa unica transacao, faz o upsert staging -> mart e marca a carga
-  como "concluida" ou "concluida_com_avisos". Em erro, rollback e "falhou"
-  gravado numa transacao separada.
+- promover: numa unica transacao, sincroniza mart.dim_produto com o config,
+  faz o upsert staging -> mart e marca a carga como "concluida" ou
+  "concluida_com_avisos". Em erro, rollback e "falhou" gravado numa transacao
+  separada.
 
 O mart so muda em promover. O DDL vive em sql/, em arquivos numerados e
 idempotentes, e e aplicado por inicializar_banco, uma vez antes da carga: pela
@@ -41,7 +42,14 @@ import pandas as pd
 import psycopg
 from dotenv import load_dotenv
 
-from anp.carregar import COLUNAS_MART, TABELA
+from anp.carregar import (
+    COLUNAS_DIM_PRODUTO,
+    COLUNAS_MART,
+    COLUNAS_OPCIONAIS,
+    TABELA,
+    TABELA_DIM_PRODUTO,
+    linhas_dim_produto,
+)
 from anp.config import RAIZ_PROJETO, Config
 from anp.erros import ErroPipeline, ErroQualidade
 from anp.extrair import _ler_manifesto
@@ -51,6 +59,7 @@ from anp.qualidade import ALERTA, Resultado, executar_testes
 log = obter_logger("carga")
 
 TABELA_MART = f"mart.{TABELA}"
+TABELA_DIM = f"mart.{TABELA_DIM_PRODUTO}"
 TABELA_STAGING = "staging.precos_semanais"
 TABELA_CARGAS = "controle.cargas"
 DIR_SQL = RAIZ_PROJETO / "sql"
@@ -61,7 +70,7 @@ CONCLUIDA = "concluida"
 CONCLUIDA_COM_AVISOS = "concluida_com_avisos"
 FALHOU = "falhou"
 
-_COLUNAS_NUMERIC = ("preco_medio", "preco_min", "preco_max", "desvio_padrao")
+_COLUNAS_NUMERIC = ("preco_medio", "preco_min", "preco_max", "desvio_padrao", *COLUNAS_OPCIONAIS)
 
 # Tipos da copia da staging no DuckDB, os mesmos do mart DuckDB, mas sem
 # restricoes: duplicata e nulo tem que chegar aos testes de qualidade.
@@ -77,6 +86,7 @@ _TIPOS_DUCKDB = {
     "desvio_padrao": "DOUBLE",
     "numero_postos": "INTEGER",
     "data_ingestao": "TIMESTAMP",
+    **{coluna: "DOUBLE" for coluna in COLUNAS_OPCIONAIS},
 }
 
 
@@ -381,11 +391,12 @@ def validar(
 # --- passo 3: promocao ao mart ---------------------------------------------------------
 
 def promover(
+    cfg: Config,
     conexao: psycopg.Connection,
     id_carga: str,
     resultados: list[Resultado],
 ) -> int:
-    """Upsert staging -> mart e status final da carga, na mesma transacao.
+    """dim_produto, upsert staging -> mart e status final, na mesma transacao.
 
     So promove carga ainda "iniciada": uma carga reprovada em validar ja esta
     "falhou" e nunca chega ao mart. Devolve o total de linhas carregadas.
@@ -408,6 +419,18 @@ def promover(
     try:
         _exigir_staging_da_carga(conexao, id_carga)
         with conexao.transaction():
+            with conexao.cursor() as cursor_dim:
+                cursor_dim.executemany(
+                    f"""
+                    INSERT INTO {TABELA_DIM} ({", ".join(COLUNAS_DIM_PRODUTO)})
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (produto) DO UPDATE SET
+                        rotulo_anp = EXCLUDED.rotulo_anp,
+                        unidade = EXCLUDED.unidade,
+                        categoria = EXCLUDED.categoria
+                    """,
+                    linhas_dim_produto(cfg),
+                )
             antes = conexao.execute(f"SELECT COUNT(*) FROM {TABELA_MART}").fetchone()[0]
             cursor = conexao.execute(
                 f"""
@@ -461,7 +484,7 @@ def carregar(
     try:
         id_carga = carregar_staging(cfg, df_staging, con)
         resultados = validar(cfg, con, id_carga, semana=semana)
-        return promover(con, id_carga, resultados)
+        return promover(cfg, con, id_carga, resultados)
     finally:
         if propria:
             con.close()

@@ -15,13 +15,13 @@ from uuid import uuid4
 import pytest
 
 from anp import carregar_postgres
-from anp.carregar import carregar, conectar
+from anp.carregar import COLUNAS_OPCIONAIS, carregar, conectar
 from anp.config import carregar_config
 from anp.erros import ErroPipeline, ErroQualidade
 from anp.pipeline import executar
 from anp.qualidade import ALERTA
 from anp.transformar import transformar
-from conftest import escrever_planilha, semana_completa
+from conftest import LINHAS_POR_SEMANA, escrever_planilha, semana_completa
 
 SHA = "c" * 64
 URL_FONTE = "https://exemplo.invalido/semanal-estados.xlsx"
@@ -166,6 +166,7 @@ def test_ddl_e_idempotente_e_mart_espelha_o_duckdb(con_pg):
     assert aplicados == [
         "001_schemas.sql", "002_mart_fato_precos_semanais.sql",
         "003_controle_cargas.sql", "004_staging_precos_semanais.sql",
+        "005_colunas_escopo_produtos.sql", "006_mart_dim_produto.sql",
     ]
 
     colunas = con_pg.execute(
@@ -178,11 +179,16 @@ def test_ddl_e_idempotente_e_mart_espelha_o_duckdb(con_pg):
     assert [c for c, _ in colunas] == [
         "data_inicio", "data_fim", "uf", "regiao", "produto", "preco_medio",
         "preco_min", "preco_max", "desvio_padrao", "numero_postos", "data_ingestao",
+        "coef_variacao_revenda", "margem_media_revenda", "preco_medio_distribuicao",
+        "preco_min_distribuicao", "preco_max_distribuicao",
+        "desvio_padrao_distribuicao", "coef_variacao_distribuicao",
     ]
     tipos = dict(colunas)
     assert tipos["preco_medio"] == "numeric"
     assert tipos["data_inicio"] == "date"
     assert tipos["numero_postos"] == "integer"
+    for coluna in COLUNAS_OPCIONAIS:
+        assert tipos[coluna] == "numeric", coluna
 
     chave = {
         linha[0] for linha in con_pg.execute(
@@ -204,7 +210,7 @@ def test_carga_dupla_nao_muda_contagem(cfg_pg, con_pg, df_valido):
     carregar(cfg_pg, df_valido, conexao=con_pg)
     carregar(cfg_pg, df_valido, conexao=con_pg)
 
-    assert apos_primeira == len(df_valido) == 108
+    assert apos_primeira == len(df_valido) == 2 * LINHAS_POR_SEMANA
     assert _contar(con_pg) == apos_primeira
     assert [c["status"] for c in _cargas(con_pg)] == ["concluida"] * 3
 
@@ -218,7 +224,7 @@ def test_carga_aprovada_registrada_como_concluida(cfg_pg, con_pg, df_valido):
     assert carga["sha256"] == SHA
     assert carga["arquivo"] == "semanal-estados_2026-09-20.xlsx"
     assert carga["url"] == URL_FONTE
-    assert carga["linhas_lidas"] == carga["linhas_carregadas"] == 108
+    assert carga["linhas_lidas"] == carga["linhas_carregadas"] == 2 * LINHAS_POR_SEMANA
     assert carga["inicio"] <= carga["fim"]
     assert carga["erro"] is None
 
@@ -258,7 +264,7 @@ def test_carga_reprovada_nao_altera_o_mart(cfg_pg, con_pg, df_valido):
 
     # Uma revisao que mudaria todas as linhas, com um preco fora da faixa.
     reprovado = df_valido.copy()
-    reprovado["preco_medio"] = 6.5
+    reprovado["preco_medio"] = (reprovado["preco_medio"] * 1.05).round(3)
     reprovado.loc[reprovado.index[0], "preco_medio"] = 99.0
 
     id_carga = carregar_postgres.carregar_staging(cfg_pg, reprovado, con_pg)
@@ -276,14 +282,15 @@ def test_carga_reprovada_nao_altera_o_mart(cfg_pg, con_pg, df_valido):
 
     # A staging preserva o que foi reprovado, para inspecao.
     assert con_pg.execute(
-        "SELECT MAX(preco_medio) FROM staging.precos_semanais WHERE id_carga = %s",
+        "SELECT COUNT(*) FROM staging.precos_semanais "
+        "WHERE id_carga = %s AND preco_medio = 99.0",
         [id_carga],
-    ).fetchone()[0] == Decimal("99.0")
+    ).fetchone()[0] == 1
     assert _contar(con_pg, "staging.precos_semanais") == len(reprovado)
 
     # E uma carga reprovada nao pode ser promovida depois.
     with pytest.raises(ErroPipeline, match="falhou"):
-        carregar_postgres.promover(con_pg, id_carga, [])
+        carregar_postgres.promover(cfg_pg, con_pg, id_carga, [])
     assert _precos_do_mart(con_pg) == mart_antes
 
 
@@ -312,7 +319,7 @@ def test_falha_na_promocao_desfaz_o_upsert(cfg_pg, con_pg, df_valido, monkeypatc
     mart_antes = _precos_do_mart(con_pg)
 
     revisado = df_valido.copy()
-    revisado["preco_medio"] = 6.5
+    revisado["preco_medio"] = (revisado["preco_medio"] * 1.05).round(3)
 
     def explodir(*_):
         raise RuntimeError("falha simulada ao atualizar controle.cargas")
@@ -335,7 +342,7 @@ def test_staging_sobrescrita_por_outra_carga_nao_e_promovida(cfg_pg, con_pg, df_
     carregar_postgres.carregar_staging(cfg_pg, df_valido.head(10), con_pg)
 
     with pytest.raises(ErroPipeline, match="reescreveu a staging"):
-        carregar_postgres.promover(con_pg, antiga, resultados)
+        carregar_postgres.promover(cfg_pg, con_pg, antiga, resultados)
     assert _contar(con_pg) == 0
     assert {str(c["id_carga"]): c["status"] for c in _cargas(con_pg)}[antiga] == "falhou"
 
@@ -351,10 +358,10 @@ def test_pipeline_com_alerta_promove_como_concluida_com_avisos(cfg_pg, con_pg, t
     resultados = executar(cfg_pg, usar_raw_existente=planilha)
 
     assert {r.nome: r.status for r in resultados}["variacao_semanal"] == ALERTA
-    assert _contar(con_pg) == 108
+    assert _contar(con_pg) == 2 * LINHAS_POR_SEMANA
     [carga] = _cargas(con_pg)
     assert carga["status"] == "concluida_com_avisos"
-    assert carga["linhas_carregadas"] == 108
+    assert carga["linhas_carregadas"] == 2 * LINHAS_POR_SEMANA
     assert carga["sha256"] == "raw-local-reaproveitado"
     assert carga["arquivo"] is None  # --usar-raw nao passa pelo manifesto
 
@@ -385,3 +392,115 @@ def test_pipeline_reprovado_sai_com_codigo_1_e_mart_intacto(cfg_pg, con_pg, tmp_
     assert _precos_do_mart(con_pg) == mart_antes
     assert [c["status"] for c in _cargas(con_pg)] == ["concluida", "falhou"]
     assert "cobertura_de_ufs" in _cargas(con_pg)[-1]["erro"]
+
+
+# --- escopo ampliado: migracao do esquema e dim_produto ---------------------
+
+@pytest.fixture
+def url_banco_esquema_antigo():
+    """Banco descartavel so com o DDL de antes do escopo ampliado (001 a 004)."""
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    base = os.environ["DATABASE_URL"]
+    nome = f"anp_pytest_antigo_{uuid4().hex[:8]}"
+    with psycopg.connect(base, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(nome)))
+    url = make_conninfo(base, dbname=nome)
+    with psycopg.connect(url, autocommit=True) as con:
+        for arquivo in sorted(carregar_postgres.DIR_SQL.glob("00[1-4]_*.sql")):
+            con.execute(arquivo.read_text(encoding="utf-8"))
+    yield url
+    with psycopg.connect(base, autocommit=True) as admin:
+        admin.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(nome)))
+
+
+@pytest.mark.postgres
+def test_ddl_novo_sobre_banco_antigo_preserva_linhas_e_carga_preenche(
+    cfg, url_banco_esquema_antigo, tmp_path, monkeypatch,
+):
+    """O 005 e o 006 rodam sobre um banco com dados: nada e recriado nem perdido."""
+    import psycopg
+
+    monkeypatch.setenv("DATABASE_URL", url_banco_esquema_antigo)
+    monkeypatch.setitem(cfg.dados["destino"], "backend", "postgres")
+    monkeypatch.setitem(cfg.dados["caminhos"], "staging", str(tmp_path / "staging"))
+    monkeypatch.setitem(cfg.dados["caminhos"], "manifesto_raw",
+                        str(tmp_path / "raw" / "_manifesto.jsonl"))
+
+    with psycopg.connect(url_banco_esquema_antigo, autocommit=True) as con:
+        con.execute(
+            "INSERT INTO mart.fato_precos_semanais VALUES ('2020-08-16', '2020-08-22', "
+            "'SE', 'NORDESTE', 'GASOLINA C', 4.5, 4.3, 4.7, 0.1, 30, "
+            "'2026-09-19 12:00:00')"
+        )
+        colunas_antes = con.execute(
+            "SELECT COUNT(*) FROM information_schema.columns "
+            "WHERE table_schema = 'mart' AND table_name = 'fato_precos_semanais'"
+        ).fetchone()[0]
+    assert colunas_antes == 11
+
+    carregar_postgres.inicializar_banco()
+    carregar_postgres.inicializar_banco()  # idempotente sobre o banco migrado
+
+    with psycopg.connect(url_banco_esquema_antigo, autocommit=True) as con:
+        linhas = con.execute(
+            "SELECT uf, produto, preco_medio, preco_medio_distribuicao, "
+            "margem_media_revenda FROM mart.fato_precos_semanais"
+        ).fetchall()
+        assert linhas == [("SE", "GASOLINA C", Decimal("4.5"), None, None)]
+        assert con.execute("SELECT COUNT(*) FROM mart.dim_produto").fetchone()[0] == 0
+
+    planilha = escrever_planilha(
+        tmp_path / "com_distribuicao.xlsx",
+        semana_completa(date(2020, 8, 16), preco_gasolina=4.5, distribuicao=True),
+    )
+    con = conectar(cfg)
+    try:
+        carregar(cfg, transformar(cfg, planilha, SHA), conexao=con)
+        linha = con.execute(
+            "SELECT preco_medio, preco_medio_distribuicao, margem_media_revenda, "
+            "coef_variacao_revenda FROM mart.fato_precos_semanais "
+            "WHERE uf = 'SE' AND produto = 'GASOLINA C'"
+        ).fetchone()
+        assert linha == (Decimal("4.5"), Decimal("3.6"), Decimal("0.9"), Decimal("0.01"))
+        assert _contar(con) == LINHAS_POR_SEMANA
+        assert con.execute("SELECT COUNT(*) FROM mart.dim_produto").fetchone()[0] == 7
+        assert [c["status"] for c in _cargas(con)] == ["concluida"]
+    finally:
+        con.close()
+
+
+@pytest.mark.postgres
+def test_dim_produto_sincronizada_com_o_config(cfg_pg, con_pg, df_valido):
+    con_pg.execute("TRUNCATE mart.dim_produto")
+    carregar(cfg_pg, df_valido, conexao=con_pg)
+    carregar(cfg_pg, df_valido, conexao=con_pg)
+
+    dim = con_pg.execute(
+        "SELECT produto, rotulo_anp, unidade, categoria FROM mart.dim_produto ORDER BY 1"
+    ).fetchall()
+    assert dim == sorted(
+        (p.produto, p.rotulo_anp, p.unidade, p.categoria)
+        for p in cfg_pg.produtos.values()
+    )
+    orfaos = con_pg.execute(
+        "SELECT COUNT(*) FROM mart.fato_precos_semanais f "
+        "LEFT JOIN mart.dim_produto d USING (produto) WHERE d.produto IS NULL"
+    ).fetchone()[0]
+    assert orfaos == 0
+    assert con_pg.execute(
+        "SELECT produto, COUNT(*) FROM mart.fato_precos_semanais GROUP BY 1 ORDER BY 1"
+    ).fetchall() == [(p, 2 * 27) for p in sorted(cfg_pg.produtos)]
+
+
+@pytest.mark.postgres
+def test_carga_reprovada_nao_sincroniza_dim_produto(cfg_pg, con_pg, df_valido):
+    """dim_produto so muda em promover, junto com o mart."""
+    con_pg.execute("TRUNCATE mart.dim_produto")
+    reprovado = df_valido.copy()
+    reprovado.loc[reprovado.index[0], "preco_medio"] = 99.0
+    with pytest.raises(ErroQualidade):
+        carregar(cfg_pg, reprovado, conexao=con_pg)
+    assert con_pg.execute("SELECT COUNT(*) FROM mart.dim_produto").fetchone()[0] == 0

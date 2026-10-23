@@ -27,6 +27,20 @@ if TYPE_CHECKING:
 log = obter_logger("carga")
 
 TABELA = "fato_precos_semanais"
+TABELA_DIM_PRODUTO = "dim_produto"
+
+# Colunas que vieram com o escopo ampliado. Ficam no fim da tabela, depois de
+# data_ingestao, porque e onde o ALTER TABLE ... ADD COLUMN as poe num banco que
+# ja existia: assim DuckDB e PostgreSQL tem a mesma ordem, novo ou migrado.
+COLUNAS_OPCIONAIS = (
+    "coef_variacao_revenda",
+    "margem_media_revenda",
+    "preco_medio_distribuicao",
+    "preco_min_distribuicao",
+    "preco_max_distribuicao",
+    "desvio_padrao_distribuicao",
+    "coef_variacao_distribuicao",
+)
 
 # A ordem das colunas aqui e a ordem do INSERT mais adiante.
 COLUNAS_MART = (
@@ -41,7 +55,10 @@ COLUNAS_MART = (
     "desvio_padrao",
     "numero_postos",
     "data_ingestao",
+    *COLUNAS_OPCIONAIS,
 )
+
+COLUNAS_DIM_PRODUTO = ("produto", "rotulo_anp", "unidade", "categoria")
 
 _DDL = f"""
 CREATE TABLE IF NOT EXISTS {TABELA} (
@@ -60,10 +77,38 @@ CREATE TABLE IF NOT EXISTS {TABELA} (
 );
 """
 
+# Idempotente: num mart criado antes do escopo ampliado, acrescenta as colunas
+# sem recriar a tabela; num mart novo, nao faz nada.
+_DDL_COLUNAS_OPCIONAIS = "\n".join(
+    f"ALTER TABLE {TABELA} ADD COLUMN IF NOT EXISTS {coluna} DOUBLE;"
+    for coluna in COLUNAS_OPCIONAIS
+)
+
+# Sem UNIQUE em rotulo_anp, ao contrario do PostgreSQL: o DuckDB nao deixa o
+# ON CONFLICT DO UPDATE atribuir a coluna com indice. A unicidade e garantida
+# antes, na validacao de [[escopo.produtos]] em anp.config.
+_DDL_DIM_PRODUTO = f"""
+CREATE TABLE IF NOT EXISTS {TABELA_DIM_PRODUTO} (
+    produto     VARCHAR  PRIMARY KEY,
+    rotulo_anp  VARCHAR  NOT NULL,
+    unidade     VARCHAR  NOT NULL,
+    categoria   VARCHAR  NOT NULL CHECK (categoria IN ('combustivel_veicular', 'glp'))
+);
+"""
+
 
 def criar_tabela(conexao: duckdb.DuckDBPyConnection) -> None:
-    """Cria a tabela analitica caso ainda nao exista."""
+    """Cria ou atualiza o esquema do mart, sem tocar nas linhas existentes."""
     conexao.execute(_DDL)
+    conexao.execute(_DDL_COLUNAS_OPCIONAIS)
+    conexao.execute(_DDL_DIM_PRODUTO)
+
+
+def linhas_dim_produto(cfg: Config) -> list[tuple[str, str, str, str]]:
+    """As linhas da dim_produto, tiradas de [[escopo.produtos]]."""
+    return [
+        (p.produto, p.rotulo_anp, p.unidade, p.categoria) for p in cfg.produtos.values()
+    ]
 
 
 def _postgres(cfg: Config) -> bool:
@@ -116,6 +161,17 @@ def carregar(
 
         con.execute("BEGIN TRANSACTION")
         try:
+            con.executemany(
+                f"""
+                INSERT INTO {TABELA_DIM_PRODUTO} ({", ".join(COLUNAS_DIM_PRODUTO)})
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (produto) DO UPDATE SET
+                    rotulo_anp = EXCLUDED.rotulo_anp,
+                    unidade = EXCLUDED.unidade,
+                    categoria = EXCLUDED.categoria
+                """,
+                linhas_dim_produto(cfg),
+            )
             con.register("staging_df", dados)
             con.execute(
                 f"""

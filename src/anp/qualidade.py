@@ -1,9 +1,14 @@
 """Etapa 4: testes de qualidade, executados contra o mart apos a carga.
 
-Tres testes sao bloqueantes e levantam ErroQualidade: chave primaria sem
-duplicata, preco medio dentro da faixa plausivel e cobertura de UFs na semana
-carregada. O quarto, variacao semanal acima do limiar, e informativo e sai
-como ALERTA -- oscilacao forte de preco e fato do mercado, nao defeito de dado.
+Quatro testes sao bloqueantes e levantam ErroQualidade: chave primaria sem
+duplicata, preco medio dentro da faixa do produto, colunas opcionais (margem,
+coeficientes e distribuicao) dentro da faixa quando preenchidas, e cobertura de
+UFs na semana carregada. O quinto, variacao semanal acima do limiar do produto,
+e informativo e sai como ALERTA -- oscilacao forte de preco e fato do mercado,
+nao defeito de dado.
+
+Faixas, UFs toleradas e limiar de variacao vem de [[escopo.produtos]] no
+config.toml, um conjunto por produto.
 """
 
 from __future__ import annotations
@@ -83,48 +88,153 @@ def testar_chave_primaria(con: duckdb.DuckDBPyConnection, cfg: Config) -> Result
     )
 
 
-def testar_faixa_de_preco(con: duckdb.DuckDBPyConnection, cfg: Config) -> Resultado:
-    """preco_medio precisa ficar na faixa plausivel definida no config."""
-    minimo = float(cfg["qualidade"]["preco_medio_minimo"])
-    maximo = float(cfg["qualidade"]["preco_medio_maximo"])
+def _limites(cfg: Config) -> tuple[str, list[Any]]:
+    """CTE com os limites de cada produto do config, e os parametros dela.
 
+    Junta as regras ao dado por SQL, num JOIN por produto, em vez de uma
+    consulta por produto.
+    """
+    produtos = list(cfg.produtos.values())
+    linha = (
+        "(CAST(? AS VARCHAR), CAST(? AS DOUBLE), CAST(? AS DOUBLE), CAST(? AS DOUBLE), "
+        "CAST(? AS DOUBLE), CAST(? AS DOUBLE), CAST(? AS DOUBLE), CAST(? AS DOUBLE))"
+    )
+    cte = (
+        "limites (produto, revenda_min, revenda_max, distribuicao_min, distribuicao_max, "
+        "desvio_max, margem_max, limiar_variacao) AS (VALUES "
+        + ", ".join(linha for _ in produtos)
+        + ")"
+    )
+    parametros: list[Any] = []
+    for p in produtos:
+        parametros += [
+            p.produto, *p.faixa_preco_revenda, *p.faixa_preco_distribuicao,
+            p.desvio_padrao_maximo, p.margem_maxima, p.variacao_semanal_alerta,
+        ]
+    return cte, parametros
+
+
+def testar_faixa_de_preco(con: duckdb.DuckDBPyConnection, cfg: Config) -> Resultado:
+    """preco_medio obrigatorio e dentro da faixa de revenda do seu produto.
+
+    A faixa e por produto: R$ 20 e absurdo para gasolina e normal para GLP.
+    Produto no mart sem bloco em [[escopo.produtos]] tambem reprova, porque nao
+    ha faixa contra a qual avalia-lo.
+    """
+    cte, parametros = _limites(cfg)
     fora = con.execute(
         f"""
-        SELECT data_inicio, uf, produto, preco_medio
-        FROM {TABELA}
-        WHERE preco_medio IS NULL OR preco_medio < ? OR preco_medio > ?
-        ORDER BY preco_medio
-        LIMIT 10
+        WITH {cte}
+        SELECT f.data_inicio, f.uf, f.produto, f.preco_medio,
+               l.revenda_min, l.revenda_max
+        FROM {TABELA} f
+        LEFT JOIN limites l ON l.produto = f.produto
+        WHERE l.produto IS NULL
+           OR f.preco_medio IS NULL
+           OR f.preco_medio < l.revenda_min
+           OR f.preco_medio > l.revenda_max
+        ORDER BY f.produto, f.preco_medio
         """,
-        [minimo, maximo],
+        parametros,
     ).fetchall()
-    total = con.execute(
-        f"""
-        SELECT COUNT(*) FROM {TABELA}
-        WHERE preco_medio IS NULL OR preco_medio < ? OR preco_medio > ?
-        """,
-        [minimo, maximo],
-    ).fetchone()[0]
 
-    if total:
+    if fora:
+        por_produto: dict[str, int] = {}
+        for _, _, produto, _, _, _ in fora:
+            por_produto[produto] = por_produto.get(produto, 0) + 1
         amostra = [
-            {"data_inicio": str(d), "uf": u, "produto": p, "preco_medio": v}
-            for d, u, p, v in fora
+            {"data_inicio": str(d), "uf": u, "produto": p, "preco_medio": v,
+             "faixa": None if mn is None else [mn, mx]}
+            for d, u, p, v, mn, mx in fora[:10]
         ]
+        sem_config = sorted({p for _, _, p, _, mn, _ in fora if mn is None})
         return Resultado(
             nome="preco_medio_na_faixa",
             status=FALHOU,
             mensagem=(
-                f"{total} linhas com preco_medio fora da faixa de R$ {minimo:.2f} "
-                f"a R$ {maximo:.2f}. Isso indica erro de parsing ou mudanca de "
-                f"unidade na fonte. Amostra: {amostra}"
+                f"{len(fora)} linhas com preco_medio nulo ou fora da faixa de revenda "
+                f"do produto ({por_produto}). Isso indica erro de parsing ou mudanca "
+                f"de unidade na fonte."
+                + (f" Produtos sem bloco em [[escopo.produtos]]: {sem_config}." if sem_config else "")
+                + f" Amostra: {amostra}"
             ),
-            detalhes={"linhas_fora": total, "amostra": amostra},
+            detalhes={"linhas_fora": len(fora), "por_produto": por_produto, "amostra": amostra},
         )
+    faixas = {p.produto: list(p.faixa_preco_revenda) for p in cfg.produtos.values()}
     return Resultado(
         nome="preco_medio_na_faixa",
         status=PASSOU,
-        mensagem=f"Todos os precos medios entre R$ {minimo:.2f} e R$ {maximo:.2f}.",
+        mensagem="Todos os precos medios dentro da faixa de revenda do produto.",
+        detalhes={"faixas": faixas},
+    )
+
+
+# (coluna, minimo, maximo): os limites sao expressoes sobre a CTE limites.
+_REGRAS_OPCIONAIS = (
+    ("preco_min", "l.revenda_min", "l.revenda_max"),
+    ("preco_max", "l.revenda_min", "l.revenda_max"),
+    ("desvio_padrao", "0", "l.desvio_max"),
+    ("coef_variacao_revenda", "0", "?"),
+    ("margem_media_revenda", "0", "l.margem_max"),
+    ("preco_medio_distribuicao", "l.distribuicao_min", "l.distribuicao_max"),
+    ("preco_min_distribuicao", "l.distribuicao_min", "l.distribuicao_max"),
+    ("preco_max_distribuicao", "l.distribuicao_min", "l.distribuicao_max"),
+    ("desvio_padrao_distribuicao", "0", "l.desvio_max"),
+    ("coef_variacao_distribuicao", "0", "?"),
+)
+
+
+def testar_colunas_opcionais(con: duckdb.DuckDBPyConnection, cfg: Config) -> Resultado:
+    """Colunas que aceitam nulo, mas, quando preenchidas, ficam na faixa do produto.
+
+    A distribuicao e a margem so existem na fonte ate 16/08/2020, entao nulo
+    passa. Valor presente fora da faixa reprova. Nao se exige min <= medio <= max
+    na distribuicao: a propria ANP publica centenas de linhas que violam isso.
+    """
+    cte, parametros = _limites(cfg)
+    coef_max = float(cfg["qualidade"]["coef_variacao_maximo"])
+    consultas = []
+    parametros_regras: list[Any] = []
+    for coluna, minimo, maximo in _REGRAS_OPCIONAIS:
+        consultas.append(
+            f"""
+            SELECT '{coluna}' AS coluna, f.data_inicio, f.uf, f.produto,
+                   CAST(f.{coluna} AS DOUBLE) AS valor
+            FROM {TABELA} f
+            JOIN limites l ON l.produto = f.produto
+            WHERE f.{coluna} IS NOT NULL
+              AND (f.{coluna} < {minimo} OR f.{coluna} > {maximo})
+            """
+        )
+        parametros_regras += [coef_max] * maximo.count("?")
+    fora = con.execute(
+        f"WITH {cte} SELECT * FROM ({' UNION ALL '.join(consultas)}) "
+        "ORDER BY coluna, produto, data_inicio, uf",
+        parametros + parametros_regras,
+    ).fetchall()
+
+    if fora:
+        por_coluna: dict[str, int] = {}
+        for coluna, *_ in fora:
+            por_coluna[coluna] = por_coluna.get(coluna, 0) + 1
+        amostra = [
+            {"coluna": c, "data_inicio": str(d), "uf": u, "produto": p, "valor": v}
+            for c, d, u, p, v in fora[:10]
+        ]
+        return Resultado(
+            nome="colunas_opcionais_na_faixa",
+            status=FALHOU,
+            mensagem=(
+                f"{len(fora)} valores preenchidos fora da faixa plausivel do produto "
+                f"({por_coluna}). Nulo e aceito nessas colunas; valor fora da faixa "
+                f"indica erro de parsing ou de unidade. Amostra: {amostra}"
+            ),
+            detalhes={"valores_fora": len(fora), "por_coluna": por_coluna, "amostra": amostra},
+        )
+    return Resultado(
+        nome="colunas_opcionais_na_faixa",
+        status=PASSOU,
+        mensagem="Colunas opcionais nulas ou dentro da faixa do produto.",
     )
 
 
@@ -133,9 +243,14 @@ def testar_cobertura_de_ufs(
 ) -> Resultado:
     """Cobertura de UFs na semana carregada, avaliada por produto.
 
-    A regra nao pode ser global: a ANP nao pesquisa etanol hidratado em toda
-    UF em toda semana. Cada produto tem sua allowlist de ausencias legitimas
-    em [qualidade.ufs_ausentes_toleradas]. Falta fora da allowlist e erro.
+    A regra nao pode ser global: a ANP nao pesquisa todo produto em toda UF em
+    toda semana (o GNV, por exemplo, nao existe em dez UFs). Cada produto tem a
+    sua lista de ausencias legitimas em ufs_ausentes_toleradas. Falta fora da
+    lista e erro.
+
+    Produto que ainda nao tem nenhuma linha ate a semana avaliada nao e cobrado:
+    a GASOLINA ADITIVADA, por exemplo, so comeca em 18/10/2020. Produto com
+    historico e sem nenhuma UF na semana reprova, como qualquer falta.
     """
     alvo = _semana_alvo(con, semana)
     if alvo is None:
@@ -146,25 +261,33 @@ def testar_cobertura_de_ufs(
         )
 
     esperadas = set(cfg.ufs.values())
-    toleradas_cfg = cfg["qualidade"]["ufs_ausentes_toleradas"]
 
     problemas: list[str] = []
-    detalhes: dict[str, Any] = {"semana": str(alvo), "por_produto": {}}
+    detalhes: dict[str, Any] = {"semana": str(alvo), "por_produto": {}, "sem_serie": []}
 
-    for produto in sorted(cfg.produtos.values()):
+    for produto in cfg.produtos.values():
+        nome = produto.produto
+        tem_historico = con.execute(
+            f"SELECT COUNT(*) > 0 FROM {TABELA} WHERE produto = ? AND data_inicio <= ?",
+            [nome, alvo],
+        ).fetchone()[0]
+        if not tem_historico:
+            detalhes["sem_serie"].append(nome)
+            continue
+
         presentes = {
             linha[0]
             for linha in con.execute(
                 f"SELECT DISTINCT uf FROM {TABELA} WHERE data_inicio = ? AND produto = ?",
-                [alvo, produto],
+                [alvo, nome],
             ).fetchall()
         }
-        toleradas = set(toleradas_cfg.get(produto, []))
+        toleradas = set(produto.ufs_ausentes_toleradas)
         ausentes = esperadas - presentes
         nao_toleradas = sorted(ausentes - toleradas)
         toleradas_ausentes = sorted(ausentes & toleradas)
 
-        detalhes["por_produto"][produto] = {
+        detalhes["por_produto"][nome] = {
             "ufs_presentes": len(presentes),
             "ufs_exigidas": len(esperadas - toleradas),
             "ausentes_toleradas": toleradas_ausentes,
@@ -173,7 +296,7 @@ def testar_cobertura_de_ufs(
 
         if nao_toleradas:
             problemas.append(
-                f"{produto}: faltam {nao_toleradas} na semana de {alvo} "
+                f"{nome}: faltam {nao_toleradas} na semana de {alvo} "
                 f"({len(presentes)} de {len(esperadas)} UFs presentes)"
             )
         elif toleradas_ausentes:
@@ -181,7 +304,7 @@ def testar_cobertura_de_ufs(
                 "UF ausente dentro da allowlist",
                 extra={
                     "evento": "cobertura_tolerada",
-                    "produto": produto,
+                    "produto": nome,
                     "ufs": toleradas_ausentes,
                     "semana": str(alvo),
                 },
@@ -195,8 +318,8 @@ def testar_cobertura_de_ufs(
                 "Cobertura de UFs incompleta na semana carregada. "
                 + "; ".join(problemas)
                 + ". Se a ausencia for legitima, inclua a UF em "
-                "[qualidade.ufs_ausentes_toleradas] no config.toml; caso "
-                "contrario, a extracao perdeu linhas."
+                "ufs_ausentes_toleradas do produto em [[escopo.produtos]] no "
+                "config.toml; caso contrario, a extracao perdeu linhas."
             ),
             detalhes=detalhes,
         )
@@ -216,14 +339,15 @@ def testar_cobertura_de_ufs(
 def testar_variacao_semanal(
     con: duckdb.DuckDBPyConnection, cfg: Config, semana: date | None = None
 ) -> Resultado:
-    """Variacao de preco acima do limiar entre semanas consecutivas.
+    """Variacao de preco acima do limiar do produto entre semanas consecutivas.
 
     A comparacao usa LAG sobre as semanas ordenadas de cada serie, e nao
     data_inicio - 7 dias: a serie da ANP tem tres descontinuidades (agosto de
     2015, a suspensao de agosto a outubro de 2020 e setembro de 2022), e
     subtrair sete dias compararia contra semana inexistente nesses pontos.
 
-    O desfecho e ALERTA, nunca erro: preco de combustivel oscila de verdade.
+    O limiar e por produto (o GNV oscila mais). O desfecho e ALERTA, nunca
+    erro: preco de combustivel oscila de verdade.
     """
     alvo = _semana_alvo(con, semana)
     if alvo is None:
@@ -233,10 +357,12 @@ def testar_variacao_semanal(
             mensagem="O mart esta vazio: nao ha semana para avaliar.",
         )
 
-    limiar = float(cfg["qualidade"]["variacao_semanal_alerta"])
+    limiares = {p.produto: p.variacao_semanal_alerta for p in cfg.produtos.values()}
+    cte, parametros = _limites(cfg)
     linhas = con.execute(
         f"""
-        WITH serie AS (
+        WITH {cte},
+        serie AS (
             SELECT
                 data_inicio,
                 uf,
@@ -251,21 +377,22 @@ def testar_variacao_semanal(
             FROM {TABELA}
         )
         SELECT
-            uf,
-            produto,
-            semana_anterior,
-            preco_anterior,
-            preco_medio,
-            (preco_medio - preco_anterior) / preco_anterior AS variacao,
-            date_diff('day', semana_anterior, data_inicio) AS dias_desde_anterior
-        FROM serie
-        WHERE data_inicio = ?
-          AND preco_anterior IS NOT NULL
-          AND preco_anterior > 0
-          AND abs((preco_medio - preco_anterior) / preco_anterior) > ?
+            s.uf,
+            s.produto,
+            s.semana_anterior,
+            s.preco_anterior,
+            s.preco_medio,
+            (s.preco_medio - s.preco_anterior) / s.preco_anterior AS variacao,
+            date_diff('day', s.semana_anterior, s.data_inicio) AS dias_desde_anterior
+        FROM serie s
+        JOIN limites l ON l.produto = s.produto
+        WHERE s.data_inicio = ?
+          AND s.preco_anterior IS NOT NULL
+          AND s.preco_anterior > 0
+          AND abs((s.preco_medio - s.preco_anterior) / s.preco_anterior) > l.limiar_variacao
         ORDER BY abs(variacao) DESC
         """,
-        [alvo, limiar],
+        parametros + [alvo],
     ).fetchall()
 
     if not linhas:
@@ -273,9 +400,9 @@ def testar_variacao_semanal(
             nome="variacao_semanal",
             status=PASSOU,
             mensagem=(
-                f"Nenhuma variacao acima de {limiar:.0%} na semana de {alvo}."
+                f"Nenhuma variacao acima do limiar do produto na semana de {alvo}."
             ),
-            detalhes={"semana": str(alvo), "limiar": limiar},
+            detalhes={"semana": str(alvo), "limiares": limiares},
         )
 
     ocorrencias = [
@@ -286,6 +413,7 @@ def testar_variacao_semanal(
             "preco_anterior": round(pa, 3),
             "preco_atual": round(pm, 3),
             "variacao_pct": round(var * 100, 2),
+            "limiar_pct": round(limiares[produto] * 100, 2),
             "dias_desde_semana_anterior": dias,
         }
         for uf, produto, anterior, pa, pm, var, dias in linhas
@@ -294,16 +422,17 @@ def testar_variacao_semanal(
         nome="variacao_semanal",
         status=ALERTA,
         mensagem=(
-            f"{len(ocorrencias)} series com variacao acima de {limiar:.0%} na "
+            f"{len(ocorrencias)} series com variacao acima do limiar do produto na "
             f"semana de {alvo}. Nao bloqueia a carga."
         ),
-        detalhes={"semana": str(alvo), "limiar": limiar, "ocorrencias": ocorrencias},
+        detalhes={"semana": str(alvo), "limiares": limiares, "ocorrencias": ocorrencias},
     )
 
 
 TESTES = (
     testar_chave_primaria,
     testar_faixa_de_preco,
+    testar_colunas_opcionais,
     testar_cobertura_de_ufs,
     testar_variacao_semanal,
 )

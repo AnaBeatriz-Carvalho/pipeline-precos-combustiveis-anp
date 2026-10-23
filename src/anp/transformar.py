@@ -17,15 +17,17 @@ from pathlib import Path
 import openpyxl
 import pandas as pd
 
-from anp.config import Config
+from anp.config import Config, normalizar_unidade
 from anp.erros import ErroEsquema
 from anp.log import obter_logger
 
 log = obter_logger("transformacao")
 
 # Colunas da fonte que o staging aproveita -> nome normalizado.
-# Margem e as cinco colunas de DISTRIBUICAO ficam de fora: estao fora do
-# escopo da v1 e sao justamente as que a ANP preenche com "-".
+# As colunas de revenda sem sufixo (preco_medio, preco_min, preco_max,
+# desvio_padrao) mantem o nome que ja tinham no mart. Margem e as cinco colunas
+# de DISTRIBUICAO so sao preenchidas ate 16/08/2020; depois a ANP manda "-",
+# que vira nulo.
 _RENOMEACAO = {
     "DATA INICIAL": "data_inicio",
     "DATA FINAL": "data_fim",
@@ -38,7 +40,13 @@ _RENOMEACAO = {
     "DESVIO PADRÃO REVENDA": "desvio_padrao",
     "PREÇO MÍNIMO REVENDA": "preco_min",
     "PREÇO MÁXIMO REVENDA": "preco_max",
-    "COEF DE VARIAÇÃO REVENDA": "coef_variacao",
+    "MARGEM MÉDIA REVENDA": "margem_media_revenda",
+    "COEF DE VARIAÇÃO REVENDA": "coef_variacao_revenda",
+    "PREÇO MÉDIO DISTRIBUIÇÃO": "preco_medio_distribuicao",
+    "DESVIO PADRÃO DISTRIBUIÇÃO": "desvio_padrao_distribuicao",
+    "PREÇO MÍNIMO DISTRIBUIÇÃO": "preco_min_distribuicao",
+    "PREÇO MÁXIMO DISTRIBUIÇÃO": "preco_max_distribuicao",
+    "COEF DE VARIAÇÃO DISTRIBUIÇÃO": "coef_variacao_distribuicao",
 }
 
 _COLUNAS_NUMERICAS = (
@@ -46,7 +54,13 @@ _COLUNAS_NUMERICAS = (
     "preco_min",
     "preco_max",
     "desvio_padrao",
-    "coef_variacao",
+    "coef_variacao_revenda",
+    "margem_media_revenda",
+    "preco_medio_distribuicao",
+    "preco_min_distribuicao",
+    "preco_max_distribuicao",
+    "desvio_padrao_distribuicao",
+    "coef_variacao_distribuicao",
 )
 
 # Sem estes valores a linha nao serve para o mart.
@@ -63,7 +77,13 @@ COLUNAS_STAGING = (
     "preco_min",
     "preco_max",
     "desvio_padrao",
-    "coef_variacao",
+    "coef_variacao_revenda",
+    "margem_media_revenda",
+    "preco_medio_distribuicao",
+    "preco_min_distribuicao",
+    "preco_max_distribuicao",
+    "desvio_padrao_distribuicao",
+    "coef_variacao_distribuicao",
     "numero_postos",
     "unidade_medida",
     "origem_sha256",
@@ -184,7 +204,7 @@ def transformar(cfg: Config, caminho_raw: Path, origem_sha256: str) -> pd.DataFr
     df = bruto[list(_RENOMEACAO)].rename(columns=_RENOMEACAO)
 
     # --- produto: "Gasolina C" nao existe na fonte, o rotulo e GASOLINA COMUM.
-    mapa_produtos = cfg.produtos
+    mapa_produtos = cfg.rotulos_anp
     df["produto"] = df["produto"].astype("string").str.strip().str.upper()
     disponiveis = set(df["produto"].dropna().unique())
     sumidos = [p for p in mapa_produtos if p not in disponiveis]
@@ -205,17 +225,21 @@ def transformar(cfg: Config, caminho_raw: Path, origem_sha256: str) -> pd.DataFr
         },
     )
 
-    # --- unidade de medida: preco por litro. Se mudar, os limiares nao valem.
-    unidade_esperada = str(cfg["escopo"]["unidade_esperada"]).strip().lower()
-    unidades = (
-        df["unidade_medida"].astype("string").str.strip().str.lower().dropna().unique()
-    )
-    divergentes = [u for u in unidades if u != unidade_esperada]
-    if divergentes:
+    # --- unidade de medida, por produto. Se mudar, as faixas de preco nao valem.
+    df["unidade_medida"] = df["unidade_medida"].astype("string").str.strip()
+    divergencias = []
+    for produto in cfg.produtos.values():
+        esperada = normalizar_unidade(produto.unidade)
+        unidades = df.loc[df["produto"] == produto.produto, "unidade_medida"].dropna().unique()
+        erradas = sorted(str(u) for u in unidades if normalizar_unidade(u) != esperada)
+        if erradas:
+            divergencias.append(f"{produto.produto}: {erradas}, esperado {produto.unidade!r}")
+    if divergencias:
         raise ErroEsquema(
-            f"Unidade de medida inesperada em {caminho_raw.name}: {divergentes}. "
-            f"A v1 assume {cfg['escopo']['unidade_esperada']!r} para gasolina e "
-            "etanol, e os limiares de preco em [qualidade] dependem disso."
+            f"Unidade de medida inesperada em {caminho_raw.name}: "
+            + "; ".join(divergencias)
+            + ". As faixas de preco de cada produto em [[escopo.produtos]] "
+            "dependem da unidade; revise o campo unidade no config.toml."
         )
 
     # --- estado -> sigla. A fonte so traz o nome por extenso e sem acento.
@@ -290,7 +314,6 @@ def transformar(cfg: Config, caminho_raw: Path, origem_sha256: str) -> pd.DataFr
             "escopo e valores ausentes. A planilha mudou de conteudo."
         )
 
-    df["unidade_medida"] = df["unidade_medida"].astype("string").str.strip()
     df["origem_sha256"] = pd.Series(origem_sha256, index=df.index, dtype="string")
     df["data_ingestao"] = pd.Timestamp(datetime.now(timezone.utc)).tz_localize(None)
 

@@ -16,6 +16,7 @@ from anp.transformar import (
 )
 from conftest import (
     COLUNAS_ANP,
+    LINHAS_POR_SEMANA,
     escrever_planilha,
     linha_anp,
     semana_completa,
@@ -94,11 +95,18 @@ def test_colunas_e_tipos_do_staging(cfg, planilha_valida):
     assert pd.api.types.is_float_dtype(df["preco_medio"])
     assert str(df["numero_postos"].dtype) == "Int64"
     assert str(df["uf"].dtype) == "string"
+    for coluna in ("margem_media_revenda", "coef_variacao_revenda",
+                   "preco_medio_distribuicao", "coef_variacao_distribuicao"):
+        assert pd.api.types.is_float_dtype(df[coluna]), coluna
 
 
 def test_gasolina_comum_vira_gasolina_c(cfg, planilha_valida):
     df = transformar(cfg, planilha_valida, SHA)
-    assert set(df["produto"].unique()) == {"GASOLINA C", "ETANOL HIDRATADO"}
+    assert "GASOLINA COMUM" not in set(df["produto"])
+    assert set(df["produto"].unique()) == {
+        "GASOLINA C", "GASOLINA ADITIVADA", "ETANOL HIDRATADO", "OLEO DIESEL",
+        "OLEO DIESEL S10", "GNV", "GLP",
+    }
 
 
 def test_estado_por_extenso_vira_sigla(cfg, planilha_valida):
@@ -110,14 +118,12 @@ def test_estado_por_extenso_vira_sigla(cfg, planilha_valida):
 
 def test_produtos_fora_do_escopo_sao_descartados(cfg, tmp_path):
     linhas = semana_completa(date(2026, 9, 13))
-    linhas.append(linha_anp(date(2026, 9, 13), "SERGIPE", "NORDESTE", "GLP", 100.0))
-    linhas.append(
-        linha_anp(date(2026, 9, 13), "SERGIPE", "NORDESTE", "GASOLINA ADITIVADA", 7.5)
-    )
+    linhas.append(linha_anp(date(2026, 9, 13), "SERGIPE", "NORDESTE",
+                            "QUEROSENE DE AVIACAO", 5.0))
     arq = escrever_planilha(tmp_path / "extras.xlsx", linhas)
     df = transformar(cfg, arq, SHA)
-    assert set(df["produto"].unique()) == {"GASOLINA C", "ETANOL HIDRATADO"}
-    assert len(df) == 54  # 27 UFs x 2 produtos
+    assert "QUEROSENE DE AVIACAO" not in set(df["produto"])
+    assert len(df) == LINHAS_POR_SEMANA  # 27 UFs x 7 produtos
 
 
 def test_marcador_de_ausencia_vira_nulo_sem_quebrar(cfg, tmp_path):
@@ -126,7 +132,7 @@ def test_marcador_de_ausencia_vira_nulo_sem_quebrar(cfg, tmp_path):
     linhas[0][9] = "-"   # PRECO MINIMO REVENDA
     arq = escrever_planilha(tmp_path / "traco.xlsx", linhas)
     df = transformar(cfg, arq, SHA)
-    assert len(df) == 54
+    assert len(df) == LINHAS_POR_SEMANA
     assert df["preco_min"].isna().sum() == 1
 
 
@@ -136,7 +142,7 @@ def test_linha_sem_preco_medio_e_descartada(cfg, tmp_path, caplog):
     arq = escrever_planilha(tmp_path / "sem_preco.xlsx", linhas)
     with caplog.at_level("WARNING"):
         df = transformar(cfg, arq, SHA)
-    assert len(df) == 53
+    assert len(df) == LINHAS_POR_SEMANA - 1
     assert "linhas_descartadas" in eventos(caplog)
 
 
@@ -151,7 +157,7 @@ def test_decimal_com_virgula_e_convertido(cfg, tmp_path):
 
 def test_sem_agregacao_preserva_o_grao_da_fonte(cfg, planilha_valida):
     df = transformar(cfg, planilha_valida, SHA)
-    assert len(df) == 108  # 2 semanas x 27 UFs x 2 produtos
+    assert len(df) == 2 * LINHAS_POR_SEMANA  # 2 semanas x 27 UFs x 7 produtos
     assert not df.duplicated(subset=["data_inicio", "uf", "produto"]).any()
 
 
@@ -190,6 +196,58 @@ def test_unidade_de_medida_diferente_falha(cfg, tmp_path):
     assert "galao" in str(exc.value).lower()
 
 
+def test_unidade_e_validada_por_produto(cfg, tmp_path):
+    """GLP em R$/l e erro, mesmo sendo a unidade certa da gasolina."""
+    linhas = [
+        linha if linha[4] != "GLP" or linha[3] != "BAHIA"
+        else linha_anp(linha[0], "BAHIA", "NORDESTE", "GLP", 110.0, unidade="R$/l")
+        for linha in semana_completa(date(2026, 9, 13))
+    ]
+    arq = escrever_planilha(tmp_path / "glp_litro.xlsx", linhas)
+    with pytest.raises(ErroEsquema) as exc:
+        transformar(cfg, arq, SHA)
+    mensagem = str(exc.value)
+    assert "GLP" in mensagem
+    assert "R$/13kg" in mensagem
+    assert "GASOLINA C" not in mensagem
+
+
+def test_grafias_antigas_da_unidade_sao_aceitas(cfg, tmp_path):
+    """A ANP escreveu R$/13Kg e R$/m3 ate julho de 2020; a unidade e a mesma."""
+    antigas = {"GLP": "R$/13Kg", "GNV": "R$/m3"}
+    linhas = [
+        linha_anp(linha[0], linha[3], linha[2], linha[4], linha[7],
+                  unidade=antigas[linha[4]]) if linha[4] in antigas else linha
+        for linha in semana_completa(date(2020, 7, 26))
+    ] + semana_completa(date(2026, 9, 13))
+    arq = escrever_planilha(tmp_path / "grafias.xlsx", linhas)
+    df = transformar(cfg, arq, SHA)
+    assert len(df) == 2 * LINHAS_POR_SEMANA
+    glp = df[df["produto"] == "GLP"]
+    assert set(glp["unidade_medida"]) == {"R$/13Kg", "R$/13kg"}
+
+
+def test_colunas_de_distribuicao_e_margem_sao_mantidas(cfg, tmp_path):
+    """Preenchidas ate 2020, "-" depois: os dois casos convivem no staging."""
+    linhas = (semana_completa(date(2020, 8, 16), distribuicao=True)
+              + semana_completa(date(2026, 9, 13)))
+    arq = escrever_planilha(tmp_path / "distribuicao.xlsx", linhas)
+    df = transformar(cfg, arq, SHA)
+
+    antiga = df[df["data_inicio"] == "2020-08-16"]
+    recente = df[df["data_inicio"] == "2026-09-13"]
+    distribuicao = ["preco_medio_distribuicao", "preco_min_distribuicao",
+                    "preco_max_distribuicao", "desvio_padrao_distribuicao",
+                    "coef_variacao_distribuicao", "margem_media_revenda"]
+    assert antiga[distribuicao].notna().all().all()
+    assert recente[distribuicao].isna().all().all()
+    assert df["coef_variacao_revenda"].notna().all()
+
+    glp = antiga[(antiga["produto"] == "GLP") & (antiga["uf"] == "SE")].iloc[0]
+    assert glp["preco_medio_distribuicao"] == pytest.approx(88.0)
+    assert glp["margem_media_revenda"] == pytest.approx(22.0)
+
+
 def test_estado_desconhecido_falha(cfg, tmp_path):
     linhas = semana_completa(date(2026, 9, 13))
     linhas.append(
@@ -208,7 +266,7 @@ def test_semana_com_duracao_atipica_gera_warning_nao_erro(cfg, tmp_path, caplog)
     arq = escrever_planilha(tmp_path / "curta_semana.xlsx", linhas)
     with caplog.at_level("WARNING"):
         df = transformar(cfg, arq, SHA)
-    assert len(df) == 54
+    assert len(df) == LINHAS_POR_SEMANA
     assert "duracao_atipica" in eventos(caplog)
 
 

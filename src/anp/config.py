@@ -29,6 +29,110 @@ _SECOES_OBRIGATORIAS = (
 
 BACKENDS = ("duckdb", "postgres")
 
+CATEGORIAS = ("combustivel_veicular", "glp")
+
+_CAMPOS_PRODUTO = (
+    "produto",
+    "rotulo_anp",
+    "unidade",
+    "categoria",
+    "faixa_preco_revenda",
+    "faixa_preco_distribuicao",
+    "desvio_padrao_maximo",
+    "margem_maxima",
+    "variacao_semanal_alerta",
+    "ufs_ausentes_toleradas",
+)
+
+
+def normalizar_unidade(unidade: str) -> str:
+    """Forma comparavel da unidade: sem espacos nas pontas, minuscula, ³ -> 3.
+
+    A ANP muda a grafia no meio da serie (R$/13Kg -> R$/13kg, R$/m3 -> R$/m³)
+    sem mudar a unidade.
+    """
+    return str(unidade).strip().lower().replace("³", "3")
+
+
+@dataclass(frozen=True)
+class Produto:
+    """Um produto do escopo, como declarado em [[escopo.produtos]]."""
+
+    produto: str
+    rotulo_anp: str
+    unidade: str
+    categoria: str
+    faixa_preco_revenda: tuple[float, float]
+    faixa_preco_distribuicao: tuple[float, float]
+    desvio_padrao_maximo: float
+    margem_maxima: float
+    variacao_semanal_alerta: float
+    ufs_ausentes_toleradas: tuple[str, ...]
+
+
+def _faixa(bruto: Any, onde: str) -> tuple[float, float]:
+    if not isinstance(bruto, list) or len(bruto) != 2:
+        raise ErroPipeline(f"{onde} deve ser uma lista [minimo, maximo], veio {bruto!r}.")
+    minimo, maximo = float(bruto[0]), float(bruto[1])
+    if not 0 <= minimo < maximo:
+        raise ErroPipeline(
+            f"{onde} = {bruto!r} e invalida: o minimo precisa ser >= 0 e menor que o maximo."
+        )
+    return minimo, maximo
+
+
+def _ler_produtos(dados: dict[str, Any], alvo: Path) -> dict[str, Produto]:
+    """Valida [[escopo.produtos]] e devolve os produtos pelo rotulo do mart."""
+    blocos = dados["escopo"].get("produtos")
+    if not isinstance(blocos, list) or not blocos:
+        raise ErroPipeline(
+            f"Config {alvo}: [[escopo.produtos]] deve declarar ao menos um produto, "
+            "um bloco [[escopo.produtos]] por produto."
+        )
+    siglas = set(dados["ufs"].values())
+    produtos: dict[str, Produto] = {}
+    rotulos: set[str] = set()
+    for i, bloco in enumerate(blocos, start=1):
+        nome = bloco.get("produto", f"#{i}")
+        onde = f"Config {alvo}: produto {nome!r} em [[escopo.produtos]]"
+        faltando = [c for c in _CAMPOS_PRODUTO if c not in bloco]
+        if faltando:
+            raise ErroPipeline(f"{onde} sem os campos: {', '.join(faltando)}.")
+        if bloco["categoria"] not in CATEGORIAS:
+            raise ErroPipeline(
+                f"{onde}: categoria {bloco['categoria']!r} invalida. "
+                f"Use uma destas: {', '.join(CATEGORIAS)}."
+            )
+        rotulo = str(bloco["rotulo_anp"]).strip().upper()
+        if nome in produtos or rotulo in rotulos:
+            raise ErroPipeline(f"{onde}: produto ou rotulo_anp repetido.")
+        toleradas = tuple(bloco["ufs_ausentes_toleradas"])
+        desconhecidas = sorted(set(toleradas) - siglas)
+        if desconhecidas:
+            raise ErroPipeline(
+                f"{onde}: ufs_ausentes_toleradas tem siglas que nao estao em [ufs]: "
+                f"{desconhecidas}."
+            )
+        for campo in ("desvio_padrao_maximo", "margem_maxima", "variacao_semanal_alerta"):
+            if float(bloco[campo]) <= 0:
+                raise ErroPipeline(f"{onde}: {campo} precisa ser maior que zero.")
+        produtos[nome] = Produto(
+            produto=str(nome),
+            rotulo_anp=rotulo,
+            unidade=str(bloco["unidade"]),
+            categoria=str(bloco["categoria"]),
+            faixa_preco_revenda=_faixa(bloco["faixa_preco_revenda"],
+                                       f"{onde}: faixa_preco_revenda"),
+            faixa_preco_distribuicao=_faixa(bloco["faixa_preco_distribuicao"],
+                                            f"{onde}: faixa_preco_distribuicao"),
+            desvio_padrao_maximo=float(bloco["desvio_padrao_maximo"]),
+            margem_maxima=float(bloco["margem_maxima"]),
+            variacao_semanal_alerta=float(bloco["variacao_semanal_alerta"]),
+            ufs_ausentes_toleradas=toleradas,
+        )
+        rotulos.add(rotulo)
+    return produtos
+
 
 @dataclass(frozen=True)
 class Config:
@@ -46,9 +150,14 @@ class Config:
         return (self.raiz / bruto).resolve()
 
     @property
-    def produtos(self) -> dict[str, str]:
+    def produtos(self) -> dict[str, Produto]:
+        """Produtos do escopo pelo rotulo do mart, na ordem do config."""
+        return _ler_produtos(self.dados, self.raiz / "config.toml")
+
+    @property
+    def rotulos_anp(self) -> dict[str, str]:
         """Mapa rotulo-na-ANP -> rotulo normalizado do mart."""
-        return dict(self.dados["escopo"]["produtos"])
+        return {p.rotulo_anp: p.produto for p in self.produtos.values()}
 
     @property
     def ufs(self) -> dict[str, str]:
@@ -92,5 +201,8 @@ def carregar_config(caminho: Path | str | None = None) -> Config:
             f"Config {alvo}: destino.backend = {backend!r} nao e suportado. "
             f"Use um destes: {', '.join(BACKENDS)}."
         )
+
+    # Valida ja na carga: um erro no bloco de produtos aparece antes do download.
+    _ler_produtos(dados, alvo)
 
     return Config(dados=dados, raiz=RAIZ_PROJETO)

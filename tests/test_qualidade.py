@@ -14,6 +14,7 @@ from anp.qualidade import (
     PASSOU,
     executar_testes,
     testar_chave_primaria,
+    testar_colunas_opcionais,
     testar_cobertura_de_ufs,
     testar_faixa_de_preco,
     testar_variacao_semanal,
@@ -42,17 +43,14 @@ def test_constraint_do_banco_rejeita_chave_repetida(cfg, mart):
 
 def test_duplicata_e_detectada_quando_a_constraint_nao_existe(cfg):
     """Se a tabela for recriada sem PK, o teste ainda pega a duplicata."""
+    from anp.carregar import criar_tabela
+
     con = duckdb.connect(":memory:")
-    con.execute(
-        """
-        CREATE TABLE fato_precos_semanais (
-            data_inicio DATE, data_fim DATE, uf VARCHAR, regiao VARCHAR,
-            produto VARCHAR, preco_medio DOUBLE, preco_min DOUBLE,
-            preco_max DOUBLE, desvio_padrao DOUBLE, numero_postos INTEGER,
-            data_ingestao TIMESTAMP
-        )
-        """
-    )
+    criar_tabela(con)
+    # CREATE TABLE AS copia as colunas, mas nao a chave primaria.
+    con.execute("CREATE TABLE sem_pk AS SELECT * FROM fato_precos_semanais LIMIT 0")
+    con.execute("DROP TABLE fato_precos_semanais")
+    con.execute("ALTER TABLE sem_pk RENAME TO fato_precos_semanais")
     linha = {"data_inicio": SEMANA, "uf": "SE", "produto": "GASOLINA C",
              "preco_medio": 7.0}
     inserir(con, [linha])
@@ -88,6 +86,96 @@ def test_limites_da_faixa_sao_inclusivos(cfg, mart, preco):
     assert testar_faixa_de_preco(mart, cfg).status == PASSOU
 
 
+def test_glp_em_reais_por_13kg_passa_na_faixa_dele(cfg, mart):
+    """R$ 110 o botijao e normal para GLP; seria absurdo para gasolina."""
+    inserir(mart, [{"data_inicio": SEMANA, "uf": "SE", "produto": "GLP",
+                    "preco_medio": 110.0}])
+    assert testar_faixa_de_preco(mart, cfg).status == PASSOU
+    assert testar_colunas_opcionais(mart, cfg).status == PASSOU
+
+
+@pytest.mark.parametrize("produto, preco", [
+    ("GLP", 19.99),          # abaixo de R$ 20: preco por kg, nao por botijao
+    ("GLP", 250.01),
+    ("GASOLINA C", 110.0),   # o preco do GLP na gasolina
+    ("GNV", 0.47),           # erro de escala /10
+])
+def test_faixa_de_preco_e_por_produto(cfg, mart, produto, preco):
+    inserir(mart, [{"data_inicio": SEMANA, "uf": "SE", "produto": produto,
+                    "preco_medio": preco}])
+    resultado = testar_faixa_de_preco(mart, cfg)
+    assert resultado.status == FALHOU
+    assert resultado.detalhes["por_produto"] == {produto: 1}
+
+
+def test_produto_sem_bloco_no_config_reprova(cfg, mart):
+    inserir(mart, [{"data_inicio": SEMANA, "uf": "SE", "produto": "QUEROSENE",
+                    "preco_medio": 5.0}])
+    resultado = testar_faixa_de_preco(mart, cfg)
+    assert resultado.status == FALHOU
+    assert "QUEROSENE" in resultado.mensagem
+    assert "[[escopo.produtos]]" in resultado.mensagem
+
+
+# --- colunas opcionais: margem, coeficientes e distribuicao -----------------
+
+def test_distribuicao_nula_passa(cfg, mart):
+    """Depois de agosto de 2020 a ANP manda "-": nulo e o normal."""
+    semana_no_mart(mart, SEMANA)
+    nulos = mart.execute(
+        "SELECT COUNT(*) FROM fato_precos_semanais WHERE preco_medio_distribuicao IS NULL"
+    ).fetchone()[0]
+    assert nulos > 0
+    assert testar_colunas_opcionais(mart, cfg).status == PASSOU
+
+
+def test_distribuicao_preenchida_dentro_da_faixa_passa(cfg, mart):
+    inserir(mart, [
+        {"data_inicio": SEMANA, "uf": "SE", "produto": "GASOLINA C", "preco_medio": 4.5,
+         "preco_medio_distribuicao": 3.6, "preco_min_distribuicao": 3.4,
+         "preco_max_distribuicao": 3.8, "desvio_padrao_distribuicao": 0.07,
+         "coef_variacao_distribuicao": 0.02, "margem_media_revenda": 0.9,
+         "coef_variacao_revenda": 0.03},
+        {"data_inicio": SEMANA, "uf": "SE", "produto": "GLP", "preco_medio": 70.0,
+         "preco_medio_distribuicao": 44.0, "preco_min_distribuicao": 14.0,
+         "margem_media_revenda": 26.0, "desvio_padrao": 13.0},
+    ])
+    assert testar_colunas_opcionais(mart, cfg).status == PASSOU
+
+
+@pytest.mark.parametrize("coluna, valor", [
+    ("preco_medio_distribuicao", 20.0),
+    ("preco_min_distribuicao", 0.3),
+    ("preco_max_distribuicao", 15.5),
+    ("desvio_padrao_distribuicao", 6.0),
+    ("coef_variacao_distribuicao", 1.2),
+    ("margem_media_revenda", -0.1),
+    ("coef_variacao_revenda", -0.01),
+    ("desvio_padrao", 5.5),
+    ("preco_max", 16.0),
+])
+def test_valor_presente_fora_da_faixa_reprova(cfg, mart, coluna, valor):
+    inserir(mart, [{"data_inicio": SEMANA, "uf": "SE", "produto": "GASOLINA C",
+                    "preco_medio": 6.0, coluna: valor}])
+    resultado = testar_colunas_opcionais(mart, cfg)
+    assert resultado.status == FALHOU
+    assert resultado.detalhes["por_coluna"] == {coluna: 1}
+    assert resultado.detalhes["amostra"][0]["valor"] == pytest.approx(valor)
+
+
+def test_faixa_de_distribuicao_tambem_e_por_produto(cfg, mart):
+    """R$ 44 de distribuicao passa no GLP e reprova na gasolina."""
+    inserir(mart, [
+        {"data_inicio": SEMANA, "uf": "SE", "produto": "GLP", "preco_medio": 70.0,
+         "preco_medio_distribuicao": 44.0},
+        {"data_inicio": SEMANA, "uf": "SE", "produto": "GASOLINA C", "preco_medio": 6.0,
+         "preco_medio_distribuicao": 44.0},
+    ])
+    resultado = testar_colunas_opcionais(mart, cfg)
+    assert resultado.status == FALHOU
+    assert [a["produto"] for a in resultado.detalhes["amostra"]] == ["GASOLINA C"]
+
+
 # --- cobertura de UFs, por produto ------------------------------------------
 
 def test_cobertura_completa_passa(cfg, mart):
@@ -95,6 +183,62 @@ def test_cobertura_completa_passa(cfg, mart):
     resultado = testar_cobertura_de_ufs(mart, cfg)
     assert resultado.status == PASSOU
     assert resultado.detalhes["por_produto"]["GASOLINA C"]["ufs_presentes"] == 27
+    assert set(resultado.detalhes["por_produto"]) == set(cfg.produtos)
+
+
+GNV_TOLERADAS = ["AC", "AP", "DF", "GO", "MA", "MS", "PA", "PI", "RO", "RR", "TO"]
+
+
+def test_gnv_sem_as_ufs_sem_pesquisa_passa(cfg, mart):
+    """A ANP nao pesquisa GNV em dez UFs, e MS falta com frequencia."""
+    todas = sorted(cfg.ufs.values())
+    semana_no_mart(mart, SEMANA, ufs={"GNV": [u for u in todas if u not in GNV_TOLERADAS]})
+    resultado = testar_cobertura_de_ufs(mart, cfg)
+    assert resultado.status == PASSOU
+    assert resultado.detalhes["por_produto"]["GNV"]["ufs_exigidas"] == 16
+    assert resultado.detalhes["por_produto"]["GNV"]["ausentes_toleradas"] == GNV_TOLERADAS
+
+
+@pytest.mark.parametrize("produto, uf", [
+    ("GNV", "SP"),
+    ("GNV", "AM"),
+    ("GLP", "AP"),
+    ("OLEO DIESEL S10", "AP"),
+    ("OLEO DIESEL", "SE"),
+])
+def test_uf_ausente_nao_tolerada_reprova(cfg, mart, produto, uf):
+    todas = sorted(cfg.ufs.values())
+    semana_no_mart(mart, SEMANA, ufs={produto: [u for u in todas if u != uf]})
+    resultado = testar_cobertura_de_ufs(mart, cfg)
+    assert resultado.status == FALHOU
+    assert resultado.detalhes["por_produto"][produto]["ausentes_nao_toleradas"] == [uf]
+    assert produto in resultado.mensagem
+
+
+@pytest.mark.parametrize("produto", ["GASOLINA ADITIVADA", "OLEO DIESEL"])
+def test_amapa_tolerado_nos_produtos_com_ausencia_frequente(cfg, mart, produto):
+    todas = sorted(cfg.ufs.values())
+    semana_no_mart(mart, SEMANA, ufs={produto: [u for u in todas if u != "AP"]})
+    assert testar_cobertura_de_ufs(mart, cfg).status == PASSOU
+
+
+def test_produto_sem_serie_ate_a_semana_nao_e_cobrado(cfg, mart):
+    """A GASOLINA ADITIVADA so comeca em outubro de 2020."""
+    outros = [p for p in cfg.produtos if p != "GASOLINA ADITIVADA"]
+    semana_no_mart(mart, date(2019, 1, 6), produtos=outros)
+    semana_no_mart(mart, SEMANA)
+    resultado = testar_cobertura_de_ufs(mart, cfg, semana=date(2019, 1, 6))
+    assert resultado.status == PASSOU
+    assert resultado.detalhes["sem_serie"] == ["GASOLINA ADITIVADA"]
+
+
+def test_produto_com_historico_e_sem_a_semana_reprova(cfg, mart):
+    """Se a semana chegou sem um produto inteiro, a extracao perdeu linhas."""
+    semana_no_mart(mart, ANTERIOR)
+    semana_no_mart(mart, SEMANA, produtos=[p for p in cfg.produtos if p != "GLP"])
+    resultado = testar_cobertura_de_ufs(mart, cfg)
+    assert resultado.status == FALHOU
+    assert resultado.detalhes["por_produto"]["GLP"]["ufs_presentes"] == 0
 
 
 def test_etanol_sem_amapa_passa_por_estar_na_allowlist(cfg, mart):
@@ -204,6 +348,25 @@ def test_primeira_semana_da_serie_nao_gera_alerta(cfg, mart):
     assert testar_variacao_semanal(mart, cfg).status == PASSOU
 
 
+def test_limiar_de_variacao_e_por_produto(cfg, mart):
+    """+20% alerta na gasolina (limiar 15%) e nao no GNV (limiar 25%)."""
+    semana_no_mart(mart, ANTERIOR)
+    semana_no_mart(mart, SEMANA, precos={"GASOLINA C": 7.2, "GNV": 4.7 * 1.2})
+    resultado = testar_variacao_semanal(mart, cfg)
+    assert resultado.status == ALERTA
+    assert {o["produto"] for o in resultado.detalhes["ocorrencias"]} == {"GASOLINA C"}
+    assert resultado.detalhes["ocorrencias"][0]["limiar_pct"] == pytest.approx(15.0)
+    assert resultado.detalhes["limiares"]["GNV"] == pytest.approx(0.25)
+
+
+def test_gnv_acima_do_limiar_dele_alerta(cfg, mart):
+    semana_no_mart(mart, ANTERIOR)
+    semana_no_mart(mart, SEMANA, precos={"GNV": 4.7 * 1.3})
+    resultado = testar_variacao_semanal(mart, cfg)
+    assert resultado.status == ALERTA
+    assert {o["produto"] for o in resultado.detalhes["ocorrencias"]} == {"GNV"}
+
+
 def test_variacao_isola_cada_uf_e_produto(cfg, mart):
     """A janela e por (uf, produto): o salto de uma UF nao respinga nas outras."""
     inserir(mart, [
@@ -222,7 +385,7 @@ def test_executar_testes_passa_em_dados_saudaveis(cfg, mart):
     semana_no_mart(mart, ANTERIOR)
     semana_no_mart(mart, SEMANA)
     resultados = executar_testes(mart, cfg)
-    assert len(resultados) == 4
+    assert len(resultados) == 5
     assert all(r.status == PASSOU for r in resultados)
 
 
@@ -234,8 +397,9 @@ def test_executar_testes_levanta_erro_com_todas_as_falhas(cfg, mart):
         executar_testes(mart, cfg)
     mensagem = str(exc.value)
     assert "preco_medio_na_faixa" in mensagem
+    assert "colunas_opcionais_na_faixa" in mensagem  # minimo e maximo acompanham
     assert "cobertura_de_ufs" in mensagem
-    assert "2 de 4" in mensagem
+    assert "3 de 5" in mensagem
 
 
 def test_alerta_sozinho_nao_reprova_a_carga(cfg, mart):

@@ -60,25 +60,131 @@ colunas_esperadas = [
 # A ANP usa "-" como marcador de ausencia, nao celula vazia.
 marcadores_nulos = ["-", "", "n/a"]
 
-[escopo]
-# "Gasolina C" nao existe como rotulo na fonte: o equivalente e GASOLINA COMUM.
-# GASOLINA ADITIVADA e um produto separado e esta fora da v1.
-unidade_esperada = "R$/l"
-
-[escopo.produtos]
-"GASOLINA COMUM" = "GASOLINA C"
-"ETANOL HIDRATADO" = "ETANOL HIDRATADO"
-
 [qualidade]
-preco_medio_minimo = 1.0
-preco_medio_maximo = 15.0
 ufs_esperadas = 27
+# Coeficientes de variacao (revenda e distribuicao) sao razoes: 0 a 1 para
+# todo produto. Maximo observado na serie: 0,59 (GNV).
+coef_variacao_maximo = 1.0
+
+# --- Produtos do escopo --------------------------------------------------------
+#
+# Um bloco por produto. Campos:
+#
+#   produto                   rotulo no mart. GASOLINA C e ETANOL HIDRATADO
+#                             ficam como estavam, para nao quebrar o historico.
+#   rotulo_anp                rotulo na coluna PRODUTO da planilha.
+#   unidade                   unidade esperada. A comparacao ignora maiusculas
+#                             e trata "³" como "3": a ANP escreve R$/13Kg ate
+#                             jul/2020 e R$/13kg depois, R$/m3 e depois R$/m³.
+#   categoria                 combustivel_veicular ou glp.
+#   faixa_preco_revenda       [min, max] para preco medio, minimo e maximo de
+#                             revenda, limites inclusivos.
+#   faixa_preco_distribuicao  [min, max] para preco medio, minimo e maximo de
+#                             distribuicao, quando preenchidos.
+#   desvio_padrao_maximo      teto do desvio padrao de revenda e distribuicao.
+#   margem_maxima             teto da margem media de revenda (piso: 0).
+#   variacao_semanal_alerta   variacao semana a semana que gera ALERTA.
+#   ufs_ausentes_toleradas    UFs que podem faltar na semana sem reprovar.
+#
+# As faixas vieram do inventario da planilha de 22/10/2026 (710 semanas). Elas
+# cobrem a serie inteira, porque o teste de faixa avalia a tabela toda, e
+# pegam erro de escala x10 e /10. As colunas de distribuicao e a margem so
+# existem ate 16/08/2020; depois disso vem "-", e nulo e aceito.
+#
+# Regra das UFs toleradas: ausente em 10% ou mais das ultimas 104 semanas.
+# Abaixo disso a ausencia e episodica e continua reprovando, de proposito.
+
+[[escopo.produtos]]
+produto = "GASOLINA C"
+# "Gasolina C" nao existe como rotulo na fonte: o equivalente e GASOLINA COMUM.
+rotulo_anp = "GASOLINA COMUM"
+unidade = "R$/l"
+categoria = "combustivel_veicular"
+faixa_preco_revenda = [1.0, 15.0]
+faixa_preco_distribuicao = [0.5, 15.0]
+desvio_padrao_maximo = 5.0
+margem_maxima = 5.0
 variacao_semanal_alerta = 0.15
-# UFs que podem faltar legitimamente por produto: a ANP nao pesquisa etanol
-# hidratado no Amapa em boa parte das semanas. Ausencia fora desta lista e erro.
-[qualidade.ufs_ausentes_toleradas]
-"GASOLINA C" = []
-"ETANOL HIDRATADO" = ["AP"]
+# AP faltou em 3,8% das ultimas 104 semanas: episodico, nao tolerado.
+ufs_ausentes_toleradas = []
+
+[[escopo.produtos]]
+produto = "GASOLINA ADITIVADA"
+rotulo_anp = "GASOLINA ADITIVADA"
+unidade = "R$/l"
+categoria = "combustivel_veicular"
+faixa_preco_revenda = [1.0, 15.0]
+faixa_preco_distribuicao = [0.5, 15.0]
+desvio_padrao_maximo = 5.0
+margem_maxima = 5.0
+variacao_semanal_alerta = 0.15
+# Serie comeca em 18/10/2020. AP faltou em 10,6% das ultimas 104 semanas.
+ufs_ausentes_toleradas = ["AP"]
+
+[[escopo.produtos]]
+produto = "ETANOL HIDRATADO"
+rotulo_anp = "ETANOL HIDRATADO"
+unidade = "R$/l"
+categoria = "combustivel_veicular"
+faixa_preco_revenda = [1.0, 15.0]
+faixa_preco_distribuicao = [0.5, 15.0]
+desvio_padrao_maximo = 5.0
+margem_maxima = 5.0
+variacao_semanal_alerta = 0.15
+# A ANP nao pesquisa etanol no AP em boa parte das semanas (21,2%).
+ufs_ausentes_toleradas = ["AP"]
+
+[[escopo.produtos]]
+produto = "OLEO DIESEL"
+rotulo_anp = "OLEO DIESEL"
+unidade = "R$/l"
+categoria = "combustivel_veicular"
+faixa_preco_revenda = [1.0, 15.0]
+faixa_preco_distribuicao = [0.5, 15.0]
+desvio_padrao_maximo = 5.0
+margem_maxima = 5.0
+variacao_semanal_alerta = 0.15
+# AP faltou em 31,7% das ultimas 104 semanas. SE (6,7%) nao entra.
+ufs_ausentes_toleradas = ["AP"]
+
+[[escopo.produtos]]
+produto = "OLEO DIESEL S10"
+rotulo_anp = "OLEO DIESEL S10"
+unidade = "R$/l"
+categoria = "combustivel_veicular"
+faixa_preco_revenda = [1.0, 15.0]
+faixa_preco_distribuicao = [0.5, 15.0]
+desvio_padrao_maximo = 5.0
+margem_maxima = 5.0
+variacao_semanal_alerta = 0.15
+ufs_ausentes_toleradas = []
+
+[[escopo.produtos]]
+produto = "GNV"
+rotulo_anp = "GNV"
+unidade = "R$/m3"
+categoria = "combustivel_veicular"
+faixa_preco_revenda = [1.0, 15.0]
+faixa_preco_distribuicao = [0.5, 15.0]
+desvio_padrao_maximo = 5.0
+margem_maxima = 5.0
+# O GNV oscila mais: com 15%, 6 das ultimas 104 semanas teriam alerta.
+variacao_semanal_alerta = 0.25
+# Dez UFs sem pesquisa de GNV (99-100% das ultimas 104 semanas) e MS (10,6%).
+ufs_ausentes_toleradas = ["AC", "AP", "DF", "GO", "MA", "MS", "PA", "PI", "RO", "RR", "TO"]
+
+[[escopo.produtos]]
+produto = "GLP"
+rotulo_anp = "GLP"
+unidade = "R$/13kg"
+categoria = "glp"
+# Botijao de 13 kg. Serie: R$ 33,63 a R$ 143,47.
+faixa_preco_revenda = [20.0, 250.0]
+faixa_preco_distribuicao = [10.0, 250.0]
+desvio_padrao_maximo = 50.0
+margem_maxima = 60.0
+variacao_semanal_alerta = 0.15
+ufs_ausentes_toleradas = []
 
 # Nome por extenso e sem acento e a unica identificacao de estado na fonte.
 [ufs]

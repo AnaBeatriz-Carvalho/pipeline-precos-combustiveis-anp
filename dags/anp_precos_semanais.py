@@ -119,7 +119,7 @@ def anp_precos_semanais():
         cfg = carregar_config()
         with carregar_postgres.conectar(cfg) as conexao:
             return carregar_postgres.promover(
-                conexao, id_carga, [Resultado(**r) for r in resultados]
+                cfg, conexao, id_carga, [Resultado(**r) for r in resultados]
             )
 
     extracao = extrair()

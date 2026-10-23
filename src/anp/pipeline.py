@@ -66,7 +66,7 @@ def executar(
             # Cada passo e uma funcao isolada, ligada as outras so pelo id_carga.
             id_carga = carregar_postgres.carregar_staging(cfg, df, conexao)
             resultados = carregar_postgres.validar(cfg, conexao, id_carga, semana=semana_alvo)
-            carregar_postgres.promover(conexao, id_carga, resultados)
+            carregar_postgres.promover(cfg, conexao, id_carga, resultados)
         else:
             # DuckDB: carga direta no mart e qualidade depois. O alinhamento com o
             # fluxo do PostgreSQL fica para a migracao ao Airflow (ver README).
