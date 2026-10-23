@@ -11,7 +11,7 @@ rodar*; aqui o foco é o *como foi construído*.
 
 | Item | Valor |
 |---|---|
-| Objetivo | Tabela analítica semanal de preços de revenda de **gasolina C** e **etanol hidratado** por UF |
+| Objetivo | Tabela analítica semanal de preços dos **sete produtos** da planilha por UF: gasolina C, gasolina aditivada, etanol hidratado, óleo diesel, óleo diesel S10, GNV e GLP |
 | Pergunta de negócio | Em quais UFs a paridade etanol/gasolina fica abaixo de 70%? |
 | Fonte | Planilha `semanal-estados-desde-2013.xlsx` da ANP (sem API) |
 | Tipo de carga | **Full refresh** com upsert idempotente |
@@ -72,7 +72,7 @@ traz três vantagens:
 | `transformar.py` | Validação de esquema, limpeza, tipagem e gravação do Parquet |
 | `carregar.py` | Carga no DuckDB e roteamento para o Postgres conforme o backend |
 | `carregar_postgres.py` | DDL, conexão e os três passos da carga no Postgres |
-| `qualidade.py` | Os quatro testes de qualidade |
+| `qualidade.py` | Os cinco testes de qualidade, com regras por produto |
 | `pipeline.py` | CLI que encadeia tudo (`python -m anp.pipeline`) |
 | `log.py` | Logging estruturado em JSON Lines |
 | `erros.py` | Hierarquia de exceções |
@@ -82,7 +82,7 @@ Outros diretórios:
 | Caminho | Papel |
 |---|---|
 | `dags/anp_precos_semanais.py` | DAG do Airflow; só chama funções de `src/anp` |
-| `sql/001..004_*.sql` | DDL do Postgres, numerado e idempotente |
+| `sql/001..006_*.sql` | DDL do Postgres, numerado e idempotente |
 | `scripts/gerar_grafico.py` | Gráfico de 24 meses com Sergipe destacado |
 | `scripts/resumo_execucao.py` | Converte o log JSONL em resumo Markdown para o GitHub Actions |
 | `docker/postgres/init/01-bancos.sh` | Cria os bancos e usuários na primeira subida do Postgres |
@@ -146,7 +146,7 @@ mensagem que diz o que corrigir:
 | 1 | Cabeçalho na linha 18 com exatamente as 18 colunas de `colunas_esperadas` | Procura o cabeçalho nas linhas vizinhas. Se achar, diz "ajuste `linha_cabecalho` para N"; se não, lista colunas ausentes e novas |
 | 2 | Colunas usadas existem após a leitura do pandas | Sugere conferir `aba_indice` |
 | 3 | Os produtos do escopo existem na planilha | Lista os rótulos presentes e pede para atualizar `[escopo.produtos]` |
-| 4 | Unidade de medida é `R$/l` | Os limiares de preço dependem disso |
+| 4 | Unidade de medida de cada produto bate com `unidade` do seu bloco, ignorando maiúsculas e tratando `³` como `3` | Lista produto, unidade encontrada e esperada; as faixas dependem da unidade |
 | 5 | Todo nome de estado está mapeado em `[ufs]` | Lista os não mapeados |
 | 6 | Datas legíveis | Conta quantas falharam |
 
@@ -155,12 +155,12 @@ Transformações aplicadas:
 | De (fonte) | Para (staging) |
 |---|---|
 | `GASOLINA COMUM` | `GASOLINA C` |
-| `ETANOL HIDRATADO` | `ETANOL HIDRATADO` |
-| Demais produtos (diesel, GLP, GNV, aditivada) | descartados |
+| Demais rótulos do escopo | mesmo rótulo |
+| Produto fora de `[[escopo.produtos]]` | descartado |
 | Nome do estado por extenso (`SAO PAULO`) | sigla (`SP`) |
 | `-`, vazio, `n/a` | nulo |
 | Vírgula decimal (se aparecer) | ponto |
-| Colunas de distribuição e margem | descartadas (fora do escopo) |
+| Colunas de distribuição e margem | mantidas; `-` vira nulo (só há valor até 16/08/2020) |
 
 Regras adicionais:
 
@@ -176,7 +176,9 @@ O Parquet é gravado num temporário e renomeado, também de forma atômica.
 
 **Colunas do staging:** `data_inicio`, `data_fim`, `uf`, `estado`, `regiao`,
 `produto`, `preco_medio`, `preco_min`, `preco_max`, `desvio_padrao`,
-`coef_variacao`, `numero_postos`, `unidade_medida`, `origem_sha256`,
+`coef_variacao_revenda`, `margem_media_revenda`, `preco_medio_distribuicao`,
+`preco_min_distribuicao`, `preco_max_distribuicao`, `desvio_padrao_distribuicao`,
+`coef_variacao_distribuicao`, `numero_postos`, `unidade_medida`, `origem_sha256`,
 `data_ingestao`. O mart usa um subconjunto delas (seção 4).
 
 ### 3.3 Carga e qualidade: os dois backends
@@ -189,7 +191,9 @@ O comportamento **difere** entre os backends. Essa é uma pendência conhecida.
 staging DataFrame ──upsert──▶ mart ──▶ testes de qualidade
 ```
 
-1. Abre `data/mart/anp.duckdb` e cria a tabela se não existir.
+1. Abre `data/mart/anp.duckdb`, cria as tabelas se não existirem e acrescenta as
+   colunas novas a um mart antigo (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`).
+   Na transação da carga, sincroniza `dim_produto` com o config.
 2. Em transação: `INSERT ... ON CONFLICT (data_inicio, uf, produto) DO UPDATE`.
 3. Roda os testes **sobre o mart**. Se reprovar, o job falha, mas **os dados
    já estão no mart**.
@@ -220,10 +224,11 @@ Três funções independentes, ligadas apenas pelo `id_carga` (UUID):
 3. Reprovação → status `falhou` com o motivo em `erro` e `ErroQualidade`. **O
    mart não é tocado** e a staging fica disponível para inspeção.
 
-**`promover(conexao, id_carga, resultados) → linhas`**
+**`promover(cfg, conexao, id_carga, resultados) → linhas`**
 1. Recusa a carga se o status não for `iniciada`.
 2. Confere de novo que a staging é desta carga.
-3. **Numa única transação:** upsert staging → mart e atualização do status para
+3. **Numa única transação:** upsert de `mart.dim_produto` a partir do config,
+   upsert staging → mart e atualização do status para
    `concluida` (ou `concluida_com_avisos`, se houver algum ALERTA). Ou os dois
    são confirmados, ou nenhum.
 4. Se der erro: rollback, e o status `falhou` é gravado numa transação separada.
@@ -239,30 +244,54 @@ causa efeito. O DDL é um passo explícito: abrir conexão não o aplica.
 
 ### 3.4 Testes de qualidade (`qualidade.py`)
 
-Os quatro testes **sempre rodam todos** antes de qualquer exceção, para o
+Os cinco testes **sempre rodam todos** antes de qualquer exceção, para o
 relatório sair completo. Se algum bloqueante falhar, levanta `ErroQualidade`
-com o detalhamento de cada falha.
+com o detalhamento de cada falha. Faixas, UFs toleradas e limiar de variação vêm
+do bloco `[[escopo.produtos]]` de cada produto, juntados ao dado por SQL numa CTE
+de limites.
 
 | # | Teste | Regra | Severidade |
 |---|---|---|---|
 | 1 | `chave_primaria_sem_duplicata` | Nenhuma combinação `(data_inicio, uf, produto)` repetida | Bloqueia |
-| 2 | `preco_medio_na_faixa` | `preco_medio` não nulo e entre R$ 1,00 e R$ 15,00 | Bloqueia |
-| 3 | `cobertura_de_ufs` | Na semana avaliada, todas as 27 UFs presentes **por produto**, exceto as toleradas | Bloqueia |
-| 4 | `variacao_semanal` | Variação do preço médio contra a semana anterior acima de 15% | Alerta |
+| 2 | `preco_medio_na_faixa` | `preco_medio` não nulo e na `faixa_preco_revenda` do produto; produto sem bloco no config também reprova | Bloqueia |
+| 3 | `colunas_opcionais_na_faixa` | Nulo é aceito; valor presente fora da faixa reprova (ver abaixo) | Bloqueia |
+| 4 | `cobertura_de_ufs` | Na semana avaliada, todas as 27 UFs presentes **por produto**, exceto as toleradas | Bloqueia |
+| 5 | `variacao_semanal` | Variação do preço médio contra a semana anterior acima do limiar do produto | Alerta |
+
+Faixas do teste 3:
+
+| Colunas | Faixa |
+|---|---|
+| `preco_min`, `preco_max` | `faixa_preco_revenda` |
+| `preco_medio/min/max_distribuicao` | `faixa_preco_distribuicao` |
+| `desvio_padrao`, `desvio_padrao_distribuicao` | 0 a `desvio_padrao_maximo` |
+| `margem_media_revenda` | 0 a `margem_maxima` |
+| `coef_variacao_revenda`, `coef_variacao_distribuicao` | 0 a `[qualidade] coef_variacao_maximo` (1,0) |
+
+Não se exige mínimo ≤ médio ≤ máximo na distribuição: a ANP publica centenas de
+linhas que violam isso.
 
 **Semana avaliada:** a informada em `--semana` ou, por padrão, a mais recente
-(`MAX(data_inicio)`). Os testes 1 e 2 olham a tabela inteira; os testes 3 e 4
-olham só a semana avaliada.
+(`MAX(data_inicio)`). Os testes 1, 2 e 3 olham a tabela inteira; os testes 4 e
+5 olham só a semana avaliada.
 
-**Allowlist de cobertura** (`[qualidade.ufs_ausentes_toleradas]`):
+**Regras por produto:**
 
-| Produto | UFs toleradas |
-|---|---|
-| GASOLINA C | nenhuma |
-| ETANOL HIDRATADO | AP |
+| Produto | Unidade | Revenda | Distribuição | UFs toleradas | Alerta |
+|---|---|---|---|---|---|
+| GASOLINA C | R$/l | 1 – 15 | 0,50 – 15 | nenhuma | 15% |
+| GASOLINA ADITIVADA | R$/l | 1 – 15 | 0,50 – 15 | AP | 15% |
+| ETANOL HIDRATADO | R$/l | 1 – 15 | 0,50 – 15 | AP | 15% |
+| OLEO DIESEL | R$/l | 1 – 15 | 0,50 – 15 | AP | 15% |
+| OLEO DIESEL S10 | R$/l | 1 – 15 | 0,50 – 15 | nenhuma | 15% |
+| GNV | R$/m3 | 1 – 15 | 0,50 – 15 | AC, AP, DF, GO, MA, MS, PA, PI, RO, RR, TO | 25% |
+| GLP | R$/13kg | 20 – 250 | 10 – 250 | nenhuma | 15% |
 
-A allowlist é por produto: AP faltando na gasolina reprova, mesmo sendo
-tolerado no etanol.
+Desvio padrão máximo 5 e margem máxima 5 nos produtos por litro e no GNV; 50 e 60
+no GLP. Regra das UFs toleradas: ausente em 10% ou mais das últimas 104
+semanas. A allowlist é por produto: AP faltando na gasolina reprova, mesmo sendo
+tolerado no etanol. Produto sem nenhuma linha até a semana avaliada (a
+aditivada antes de 18/10/2020) não é cobrado.
 
 **Variação semanal com `LAG`.** A semana anterior é obtida com
 `LAG(preco_medio) OVER (PARTITION BY uf, produto ORDER BY data_inicio)`, e não
@@ -287,27 +316,52 @@ Mesmo grão, chave e ordem de colunas no DuckDB e no Postgres.
 | `data_fim` | date | DATE | não | Fim da semana |
 | `uf` | text | VARCHAR | não | Sigla da UF (PK) |
 | `regiao` | text | VARCHAR | não | Região geográfica |
-| `produto` | text | VARCHAR | não | `GASOLINA C` ou `ETANOL HIDRATADO` (PK) |
-| `preco_medio` | numeric | DOUBLE | não | Preço médio de revenda, R$/l |
+| `produto` | text | VARCHAR | não | Rótulo do mart, um dos sete de `dim_produto` (PK) |
+| `preco_medio` | numeric | DOUBLE | não | Preço médio de revenda, na unidade do produto |
 | `preco_min` | numeric | DOUBLE | sim | Menor preço encontrado |
 | `preco_max` | numeric | DOUBLE | sim | Maior preço encontrado |
 | `desvio_padrao` | numeric | DOUBLE | sim | Desvio padrão do preço |
 | `numero_postos` | integer | INTEGER | sim | Postos pesquisados |
 | `data_ingestao` | timestamp | TIMESTAMP | não | Momento da carga, em UTC |
+| `coef_variacao_revenda` | numeric | DOUBLE | sim | Coeficiente de variação da revenda |
+| `margem_media_revenda` | numeric | DOUBLE | sim | Revenda menos distribuição; só até 16/08/2020 |
+| `preco_medio_distribuicao` | numeric | DOUBLE | sim | Só até 16/08/2020 |
+| `preco_min_distribuicao` | numeric | DOUBLE | sim | Só até 16/08/2020 |
+| `preco_max_distribuicao` | numeric | DOUBLE | sim | Só até 16/08/2020 |
+| `desvio_padrao_distribuicao` | numeric | DOUBLE | sim | Só até 16/08/2020 |
+| `coef_variacao_distribuicao` | numeric | DOUBLE | sim | Só até 16/08/2020 |
 
 **Chave primária:** `(data_inicio, uf, produto)`.
+
+As sete colunas opcionais ficam depois de `data_ingestao`: é onde o
+`ALTER TABLE ... ADD COLUMN` as põe num banco que já existia (`sql/005`), e o
+DuckDB segue a mesma ordem.
 
 No Postgres os preços são `numeric`, e não `double precision`, para não
 introduzir erro de ponto flutuante num valor que a ANP publica como decimal.
 
-### 4.2 `staging.precos_semanais` (Postgres)
+### 4.2 `mart.dim_produto`
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `produto` | text (PK) | Rótulo do mart |
+| `rotulo_anp` | text, único no Postgres | Rótulo na planilha |
+| `unidade` | text | Unidade esperada |
+| `categoria` | text | `combustivel_veicular` ou `glp` |
+
+Populada a partir de `[[escopo.produtos]]` por upsert, na mesma transação que
+grava o mart. No DuckDB, `rotulo_anp` não tem `UNIQUE` porque o DuckDB não deixa o
+`ON CONFLICT DO UPDATE` atribuir coluna com índice; a unicidade é garantida na
+validação do config.
+
+### 4.3 `staging.precos_semanais` (Postgres)
 
 Mesmas colunas do mart, mais `id_carga uuid NOT NULL`. **De propósito, sem
 chave primária e sem `NOT NULL` nas colunas de dados:** duplicata e nulo
 precisam chegar aos testes de qualidade e ser reprovados por eles, com mensagem
 clara, em vez de estourar como erro genérico no `INSERT`.
 
-### 4.3 `controle.cargas` (Postgres)
+### 4.4 `controle.cargas` (Postgres)
 
 | Coluna | Tipo | Descrição |
 |---|---|---|
@@ -332,18 +386,20 @@ Máquina de estados:
                 └──────────────▶ falhou                  (erro ou teste bloqueante)
 ```
 
-### 4.4 Volume atual
+### 4.5 Volume atual
 
-| Métrica | Valor (22/10/2026) |
-|---|---|
-| Linhas no mart | 38.134 |
-| Período | 30/12/2012 a 11/10/2026 |
-| UFs | 27 |
-| Produtos | 2 |
+| Produto | Linhas | Com distribuição | Desde |
+|---|---|---|---|
+| GASOLINA C | 19.159 | 10.726 | 30/12/2012 |
+| GASOLINA ADITIVADA | 8.397 | 0 | 18/10/2020 |
+| ETANOL HIDRATADO | 18.975 | 10.349 | 30/12/2012 |
+| OLEO DIESEL | 19.085 | 10.709 | 30/12/2012 |
+| OLEO DIESEL S10 | 19.145 | 10.522 | 30/12/2012 |
+| GNV | 11.917 | 4.887 | 30/12/2012 |
+| GLP | 19.130 | 10.053 | 30/12/2012 |
+| **Total** | **115.808** | | até 11/10/2026 |
 
-Das combinações possíveis semana × UF × produto, faltam cerca de 205 na fonte:
-180 são o etanol no Amapá (estrutural) e o restante são ausências episódicas
-documentadas no README.
+O GNV tem menos linhas porque a ANP não o pesquisa em dez UFs.
 
 ---
 
@@ -502,10 +558,14 @@ Nenhuma constante do pipeline fica no código.
 | `[destino]` | `backend = "duckdb"` ou `"postgres"` |
 | `[caminhos]` | raw, staging, mart, manifesto, gráficos |
 | `[extracao]` | Aba, linha do cabeçalho (18), colunas esperadas, marcadores de nulo |
-| `[escopo]` | Unidade esperada e mapa de produtos |
-| `[qualidade]` | Faixa de preço, nº de UFs, limiar de variação, allowlist |
+| `[qualidade]` | Nº de UFs esperadas e teto dos coeficientes de variação |
+| `[[escopo.produtos]]` | Um bloco por produto: rótulo no mart e na ANP, unidade, categoria, faixas de revenda e distribuição, tetos de desvio e margem, limiar de variação, UFs toleradas |
 | `[ufs]` | Nome do estado → sigla (as 27 são obrigatórias) |
 | `[grafico]` | UF em destaque, produto, janela em meses |
+
+O bloco de produtos é validado ao carregar o config, antes do download:
+categoria fora da lista, faixa invertida, UF tolerada que não existe em `[ufs]`,
+rótulo repetido ou campo faltando viram `ErroPipeline`.
 
 Credenciais nunca vão no `config.toml`: `DATABASE_URL` vem do ambiente ou do
 `.env`.
@@ -536,8 +596,10 @@ esperado, o que veio e o que ajustar.
 | ANP renomeia uma coluna | `validar_cabecalho` | `ErroEsquema` listando a coluna sumida e a nova |
 | ANP renomeia um produto | `transformar` | `ErroEsquema` listando os rótulos presentes |
 | Preço lido errado (ex.: 589 em vez de 5,89) | teste 2 | Reprovação; mart intacto (Postgres) |
-| UF faltando na semana | teste 3 | Reprovação, a menos que esteja na allowlist |
-| Alta de 20% no preço | teste 4 | Alerta; carga `concluida_com_avisos` |
+| Unidade de um produto muda (ex.: GLP em R$/l) | `transformar` | `ErroEsquema` nomeando o produto e a unidade |
+| Distribuição ou margem preenchida fora da faixa | teste 3 | Reprovação; nulo passa |
+| UF faltando na semana | teste 4 | Reprovação, a menos que esteja na allowlist do produto |
+| Alta acima do limiar do produto | teste 5 | Alerta; carga `concluida_com_avisos` |
 | Duas cargas sobrescrevendo a staging | `_exigir_staging_da_carga` | `ErroPipeline`; a carga não é promovida |
 | Erro no meio do upsert | `promover` | Rollback completo; status `falhou` |
 
@@ -555,8 +617,9 @@ Garantida em três níveis:
    dentro de transação. Rodar N vezes seguidas produz 0 linhas novas e 0
    duplicatas; só `data_ingestao` e eventuais revisões da ANP mudam.
 
-Evidência: as quatro cargas de 22/10/2026 em `controle.cargas` têm todas
-38.134 linhas, e o mart continua com 38.134 linhas.
+Evidência: as duas execuções do DAG de 23/10/2026, já com os sete produtos,
+têm 115.808 linhas cada em `controle.cargas`, e o mart continua com 115.808
+linhas e nenhuma duplicata.
 
 ---
 
@@ -587,15 +650,16 @@ execuções.
 
 ## 11. Testes automatizados
 
-78 testes em `tests/`:
+136 testes em `tests/`:
 
 | Arquivo | Qtd. | Cobre |
 |---|---|---|
-| `test_transformar.py` | 20 | Validação de cabeçalho, mapeamentos, nulos, descartes |
-| `test_qualidade.py` | 23 | Os quatro testes, allowlist, `LAG` com buracos na série |
-| `test_carregar_postgres.py` | 15 | DDL idempotente, carga dupla, mart intacto em reprovação, rollback, staging sobrescrita, `numeric` exato, códigos de saída |
+| `test_qualidade.py` | 58 | Os cinco testes, faixas e allowlist por produto, colunas opcionais, `LAG` com buracos na série |
+| `test_transformar.py` | 23 | Validação de cabeçalho, unidade por produto e grafias antigas, mapeamentos, nulos, distribuição |
+| `test_carregar_postgres.py` | 18 | DDL idempotente, migração de banco antigo, `dim_produto`, carga dupla, mart intacto em reprovação, rollback, `numeric` exato, códigos de saída |
+| `test_config.py` | 15 | Leitura e validação de `[[escopo.produtos]]` |
 | `test_scripts.py` | 9 | Gráfico e resumo da execução |
-| `test_carregar.py` | 6 | Upsert no DuckDB |
+| `test_carregar.py` | 8 | Upsert no DuckDB, migração de mart antigo, `dim_produto` |
 | `test_dag.py` | 5 | DagBag sem erro, ordem das tasks, agenda, retries, reprovação sem retry |
 
 Marcadores e pulos:
@@ -632,6 +696,8 @@ Marcadores e pulos:
 | pandas | `requirements.txt` fixa 2.2.2; a imagem do Airflow traz 3.0.5, e o build sobrescreve |
 | Usuário com `CREATEDB` | Necessário para os testes; em produção, separar usuário de testes e de runtime |
 | Valores nominais | Preços não são deflacionados; comparações longas incluem inflação |
-| Qualidade só na semana avaliada | Uma anomalia antiga trazida por revisão retroativa da ANP não é detectada pelos testes 3 e 4 |
+| Qualidade só na semana avaliada | Uma ausência antiga trazida por revisão retroativa da ANP não é detectada pelos testes 4 e 5 |
+| Uma reprovação bloqueia tudo | Com sete produtos, uma UF faltando no GNV também impede a atualização da gasolina; nas últimas 52 semanas seriam 10 reprovações, contra 5 no escopo antigo |
+| Variação após longo intervalo | O `LAG` compara com a última observação, mesmo anos antes (GNV em GO: 2020 → 2025, +218%); gera alerta, não falha |
 | Sem `ETag`/`Last-Modified` | É preciso baixar os 12 MB para saber se a ANP republicou |
-| Escopo | Só gasolina C e etanol hidratado, só preço de revenda, granularidade estadual |
+| Escopo | Sete produtos da planilha semanal por estado; distribuição e margem só até 16/08/2020; granularidade estadual |

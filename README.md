@@ -51,9 +51,10 @@ país. Em Sergipe, abastecer com etanol quase nunca compensou no período.
 planilha `semanal-estados-desde-2013.xlsx`.
 
 A ANP **não expõe API REST**. Publica uma planilha XLSX de ~12 MB que sobrescreve
-a cada semana, contendo a série inteira desde 30/12/2012 — 115 mil linhas, 706
-semanas, preços médios de revenda por estado. O escopo desta v1 são os dois
-produtos da pergunta: gasolina C e etanol hidratado, 37.919 linhas.
+a cada semana, contendo a série inteira desde 30/12/2012 — 115.808 linhas e 710
+semanas em out/2026, preços médios por estado. O pipeline carrega os **sete
+produtos** da planilha: gasolina C, gasolina aditivada, etanol hidratado, óleo
+diesel, óleo diesel S10, GNV e GLP. A pergunta do projeto usa dois deles.
 
 O arquivo tem 17 linhas de cabeçalho institucional e notas de rodapé antes do
 cabeçalho real, na linha 18. A posição está no `config.toml` mas **é validada a
@@ -71,34 +72,66 @@ cada execução**, nunca assumida.
    │  data/raw/           │   arquivo como veio, nome com data de coleta
    │  *.xlsx + manifesto  │   manifesto JSONL: sha256, bytes, origem
    └──────────┬───────────┘
-              │  valida cabeçalho → ErroEsquema se divergir
+              │  valida cabeçalho e unidade por produto → ErroEsquema se divergir
               │  normaliza: GASOLINA COMUM→GASOLINA C, estado→UF, "-"→nulo
               ▼
    ┌──────────────────────┐
-   │  data/staging/       │   Parquet tipado, 379 KB
+   │  data/staging/       │   Parquet tipado
    │  precos_semanais     │   grão da fonte preservado, sem agregação
    └──────────┬───────────┘
               │  INSERT ... ON CONFLICT DO UPDATE, em transação
               ▼
    ┌──────────────────────┐
-   │  data/mart/          │   fato_precos_semanais
-   │  anp.duckdb          │   PK (data_inicio, uf, produto)
+   │  data/mart/          │   fato_precos_semanais, PK (data_inicio, uf, produto)
+   │  anp.duckdb          │   dim_produto, tirada do config.toml
    └──────────┬───────────┘
               │
               ▼
-   ┌──────────────────────────────────────────────┐
-   │  Testes de qualidade                         │
-   │  1. chave primária sem duplicata    bloqueia │
-   │  2. preço médio entre R$ 1 e R$ 15  bloqueia │
-   │  3. cobertura de UFs, por produto   bloqueia │
-   │  4. variação semanal > 15%          alerta   │
-   └──────────────────────────────────────────────┘
+   ┌──────────────────────────────────────────────────────┐
+   │  Testes de qualidade (faixas e UFs por produto)       │
+   │  1. chave primária sem duplicata            bloqueia  │
+   │  2. preço médio na faixa do produto         bloqueia  │
+   │  3. colunas opcionais na faixa, se houver   bloqueia  │
+   │  4. cobertura de UFs, por produto           bloqueia  │
+   │  5. variação semanal acima do limiar        alerta    │
+   └──────────────────────────────────────────────────────┘
 ```
 
 A tabela do mart tem granularidade **semana × UF × produto**:
 
 `data_inicio`, `data_fim`, `uf`, `regiao`, `produto`, `preco_medio`, `preco_min`,
-`preco_max`, `desvio_padrao`, `numero_postos`, `data_ingestao`
+`preco_max`, `desvio_padrao`, `numero_postos`, `data_ingestao`, e as colunas
+opcionais `coef_variacao_revenda`, `margem_media_revenda`,
+`preco_medio_distribuicao`, `preco_min_distribuicao`, `preco_max_distribuicao`,
+`desvio_padrao_distribuicao`, `coef_variacao_distribuicao`.
+
+As colunas sem sufixo são de revenda. Margem e distribuição só vêm preenchidas
+até 16/08/2020; depois a ANP publica `-`, que vira nulo.
+
+`dim_produto` tem uma linha por produto: `produto`, `rotulo_anp`, `unidade` e
+`categoria` (`combustivel_veicular` ou `glp`).
+
+### Produtos e regras de qualidade
+
+Cada produto tem um bloco `[[escopo.produtos]]` no `config.toml`, com unidade,
+faixas, UFs toleradas e limiar de alerta. Os valores vieram de um inventário da
+planilha (out/2026):
+
+| Produto | Unidade | Faixa de revenda | UFs toleradas | Alerta |
+|---|---|---|---|---|
+| GASOLINA C | R$/l | 1 – 15 | nenhuma | 15% |
+| GASOLINA ADITIVADA | R$/l | 1 – 15 | AP | 15% |
+| ETANOL HIDRATADO | R$/l | 1 – 15 | AP | 15% |
+| OLEO DIESEL | R$/l | 1 – 15 | AP | 15% |
+| OLEO DIESEL S10 | R$/l | 1 – 15 | nenhuma | 15% |
+| GNV | R$/m³ | 1 – 15 | AC, AP, DF, GO, MA, MS, PA, PI, RO, RR, TO | 25% |
+| GLP | R$/13kg | 20 – 250 | nenhuma | 15% |
+
+Uma UF entra na lista de toleradas quando faltou em 10% ou mais das últimas 104
+semanas; abaixo disso a ausência é episódica e reprova. A faixa de distribuição
+é mais baixa (0,50 – 15; GLP 10 – 250). Desvio padrão, margem e coeficientes de
+variação têm teto por produto. Um produto que ainda não existia na semana
+avaliada (a aditivada começa em 18/10/2020) não é cobrado na cobertura.
 
 ## Como rodar
 
@@ -161,7 +194,12 @@ tabelas ficam em três schemas:
 |---|---|
 | `staging.precos_semanais` | pouso da carga, reescrita a cada execução |
 | `mart.fato_precos_semanais` | mesmo grão e PK do DuckDB, preços em `numeric` |
+| `mart.dim_produto` | um produto por linha, sincronizada com o config na promoção |
 | `controle.cargas` | uma linha por execução: sha256, arquivo, status, linhas, erro |
+
+Um banco criado antes do escopo ampliado é migrado no lugar: `005` acrescenta as
+colunas com `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, sem recriar a tabela, e
+a carga seguinte as preenche.
 
 No PostgreSQL, a carga passa por três passos, cada um numa função separada de
 `anp.carregar_postgres`:
@@ -285,8 +323,17 @@ sobre a chave primária, dentro de transação: a terceira execução seguida pr
 reaproveitam o arquivo anterior em vez de acumular cópias de 12 MB por semana.
 
 **"Gasolina C" não existe na fonte.** O rótulo da ANP é `GASOLINA COMUM`, e
-`GASOLINA ADITIVADA` é um produto separado, fora do escopo. A tradução fica no
-`config.toml`, não no meio do código.
+`GASOLINA ADITIVADA` é um produto separado. A tradução fica no `config.toml`,
+não no meio do código.
+
+**Unidade validada por produto, tolerando a grafia.** A ANP escreve `R$/13Kg`
+até jul/2020 e `R$/13kg` depois, `R$/m3` e depois `R$/m³`. A comparação ignora
+maiúsculas e trata `³` como `3`; uma unidade de fato diferente (GLP em `R$/l`)
+reprova, porque as faixas de preço dependem dela.
+
+**Distribuição sem checagem de ordem.** Na revenda, mínimo ≤ médio ≤ máximo vale
+em 100% das linhas. Na distribuição, a própria ANP publica centenas de linhas
+que violam isso (445 no GNV), então só se valida a faixa de cada valor.
 
 **Falha explícita quando o esquema muda.** A validação de cabeçalho não só
 compara as colunas: se não encontrar o cabeçalho onde esperava, procura nas
@@ -296,9 +343,15 @@ a que apareceu. Nenhum `except` silencioso no projeto.
 
 **Cobertura de UF é testada por produto, não globalmente.** Uma regra global de
 "27 UFs sempre" falharia por dado correto: a ANP não pesquisa etanol no Amapá em
-boa parte das semanas. Cada produto tem sua allowlist de ausências estruturais
-em `[qualidade.ufs_ausentes_toleradas]`, e a allowlist não vaza entre produtos —
-AP faltando na gasolina reprova, mesmo sendo tolerado no etanol.
+boa parte das semanas, e GNV não existe em dez UFs. Cada produto tem sua
+allowlist em `ufs_ausentes_toleradas`, no seu bloco `[[escopo.produtos]]`, e a
+allowlist não vaza entre produtos — AP faltando na gasolina reprova, mesmo sendo
+tolerado no etanol.
+
+**Uma reprovação em qualquer produto bloqueia a carga inteira.** Com sete
+produtos, há mais chances de reprovar: simulando as últimas 52 semanas, o escopo
+antigo teria reprovado 5 e o atual reprova 10, quatro delas só pelo GNV. É o
+custo de não silenciar ausências episódicas.
 
 **Variação semanal é alerta, não erro.** Preço de combustível oscila de verdade;
 derrubar a carga por isso treinaria qualquer pessoa a ignorar o workflow
@@ -337,6 +390,10 @@ preços do mesmo instante, e pode ser lida em toda a série.
 
 ### Ausências na fonte
 
+Esta seção trata dos dois produtos da pergunta, com a série até set/2026. A
+cobertura dos demais produtos está resumida na tabela de *Produtos e regras de
+qualidade*.
+
 Das 38.124 combinações possíveis (706 semanas × 27 UFs × 2 produtos), **205 não
 existem**. Elas se dividem em dois tipos, e a distinção importa:
 
@@ -374,10 +431,11 @@ Três saltos entre semanas consecutivas, tratados pelo `LAG`:
 
 ### Escopo e granularidade
 
-- Só **gasolina C e etanol hidratado**. Diesel, GLP, GNV e gasolina aditivada
-  estão na fonte mas fora da v1.
-- Só **preço de revenda** (o que o consumidor paga). As colunas de distribuição
-  existem no arquivo, vêm majoritariamente como `-` e não foram carregadas.
+- Os sete produtos da planilha semanal por estado. Querosene, planilha por
+  município e outras fontes estão fora.
+- **Distribuição e margem só até 16/08/2020.** Depois da suspensão da pandemia
+  a ANP deixou de publicá-las; o mart as carrega como nulas a partir daí. A
+  gasolina aditivada, que começa em 18/10/2020, nunca as teve.
 - Granularidade **estadual**. A média de uma UF esconde dispersão entre
   municípios e entre postos; `preco_min`, `preco_max` e `desvio_padrao` estão no
   mart justamente para dar essa noção.
