@@ -1,5 +1,7 @@
 # Pipeline de preços de combustíveis da ANP
 
+[![CI](https://github.com/AnaBeatriz-Carvalho/pipeline-precos-combustiveis-anp/actions/workflows/ci.yml/badge.svg)](https://github.com/AnaBeatriz-Carvalho/pipeline-precos-combustiveis-anp/actions/workflows/ci.yml)
+
 Pipeline ETL semanal que transforma a série histórica do Levantamento de Preços
 da ANP numa tabela analítica consultável, com testes de qualidade que rodam a
 cada carga.

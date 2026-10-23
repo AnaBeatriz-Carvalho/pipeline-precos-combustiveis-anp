@@ -6,11 +6,16 @@ imagem do Compose (ver README).
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 import pytest
 
-pytest.importorskip("airflow")
+# skipif em vez de importorskip: o importorskip pula o modulo ja na coleta, e
+# esse pulo escapa do filtro -m (o job integracao-postgres o contaria).
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec("airflow") is None, reason="Airflow nao instalado"
+)
 
 DIR_DAGS = Path(__file__).resolve().parents[1] / "dags"
 DAG_ID = "anp_precos_semanais"

@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Um push novo na mesma branch cancela a execucao anterior.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # O projeto nao e instalado como pacote; os modulos vivem em src/.
+  PYTHONPATH: src
+
+jobs:
+  testes:
+    name: Testes (sem PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      # Sem DATABASE_URL os testes @pytest.mark.postgres sao pulados, e sem
+      # Airflow instalado tests/test_dag.py tambem: os dois tem job proprio.
+      - name: pytest
+        run: pytest -v -rs
+
+  integracao-postgres:
+    name: Integracao PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # 127.0.0.1, nao localhost: o psycopg 3.3 tenta ::1 primeiro.
+      DATABASE_URL: postgresql://anp:anp@127.0.0.1:5432/anp
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      # Mesmo usuario do Compose: dono do banco anp e com CREATEDB, porque os
+      # testes criam e removem um banco temporario.
+      - name: Criar usuario e banco anp
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE anp LOGIN CREATEDB PASSWORD 'anp'" \
+            -c "CREATE DATABASE anp OWNER anp"
+
+      - name: pytest -m postgres
+        run: pytest -m postgres -v -rs --junitxml=postgres.xml
+
+      # O job existe para que esses testes rodem: pulado aqui e falha.
+      - name: Exigir que nenhum teste postgres tenha sido pulado
+        run: |
+          python - <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          raiz = ET.parse("postgres.xml").getroot()
+          suite = raiz if raiz.tag == "testsuite" else raiz.find("testsuite")
+          total, pulados = int(suite.get("tests")), int(suite.get("skipped"))
+          print(f"testes postgres: {total}, pulados: {pulados}")
+          if total == 0 or pulados:
+              sys.exit("Nenhum teste @pytest.mark.postgres pode ser pulado neste job.")
+          EOF
+
+  imagem-airflow:
+    name: Imagem do Airflow
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Mesma tag do docker-compose.yaml: o Compose usa esta imagem sem rebuild.
+      - name: Build da imagem
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: anp-airflow:3.3.2
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: pip check
+        run: docker run --rm --entrypoint bash anp-airflow:3.3.2 -c "pip check"
+
+      - name: pytest tests/test_dag.py
+        run: |
+          docker run --rm \
+            -v "$PWD/tests:/opt/anp/tests:ro" \
+            -v "$PWD/pytest.ini:/opt/anp/pytest.ini:ro" \
+            -w /opt/anp \
+            anp-airflow:3.3.2 \
+            python -m pytest tests/test_dag.py -v -p no:cacheprovider
+
+      # Sobe o Compose com segredos descartaveis e confere que o DAG carrega.
+      # O DAG nasce pausado e nao e disparado: nada baixa a planilha da ANP.
+      - name: Gerar .env de CI
+        run: |
+          python3 - <<'EOF'
+          import base64, os, secrets
+
+          s = lambda: secrets.token_hex(16)
+          anp = s()
+          valores = {
+              "POSTGRES_PASSWORD": s(),
+              "AIRFLOW_DB_PASSWORD": s(),
+              "ANP_DB_PASSWORD": anp,
+              "ANP_DATABASE_URL": f"postgresql://anp:{anp}@postgres:5432/anp",
+              "AIRFLOW_FERNET_KEY": base64.urlsafe_b64encode(os.urandom(32)).decode(),
+              "AIRFLOW_JWT_SECRET": secrets.token_hex(32),
+              "AIRFLOW_ADMIN_USER": "admin",
+              "AIRFLOW_ADMIN_PASSWORD": s(),
+          }
+          with open(".env", "w") as arquivo:
+              arquivo.writelines(f"{k}={v}\n" for k, v in valores.items())
+          EOF
+
+      - name: Subir o Compose
+        run: docker compose up -d --no-build --wait --wait-timeout 300
+
+      - name: DAG sem erro de import
+        run: |
+          for _ in $(seq 1 30); do
+            if docker compose exec -T airflow-scheduler airflow dags list -o plain \
+                | grep -q '^anp_precos_semanais'; then
+              break
+            fi
+            sleep 5
+          done
+          docker compose exec -T airflow-scheduler airflow dags list -o plain \
+            | grep '^anp_precos_semanais'
+          erros=$(docker compose exec -T airflow-scheduler airflow dags list-import-errors -o json)
+          echo "import errors: $erros"
+          test "$erros" = "[]"
+
+      - name: Logs do Compose em caso de falha
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Derrubar o Compose
+        if: always()
+        run: docker compose down -v
