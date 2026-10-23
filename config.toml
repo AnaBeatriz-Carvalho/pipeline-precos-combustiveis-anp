@@ -18,6 +18,12 @@ user_agent = "pipeline-precos-combustiveis-anp/1.0 (portfolio; +https://github.c
 # Guarda contra o gov.br devolver uma pagina de erro com HTTP 200.
 tamanho_minimo_bytes = 1000000
 
+[destino]
+# Onde o mart e carregado: "duckdb" (arquivo em caminhos.mart_db) ou
+# "postgres" (conexao em DATABASE_URL, lida do ambiente ou do .env).
+# Credenciais nunca entram neste arquivo.
+backend = "duckdb"
+
 [caminhos]
 raw = "data/raw"
 staging = "data/staging"

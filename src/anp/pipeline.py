@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from anp import carregar_postgres
 from anp.carregar import carregar, conectar
 from anp.config import Config, carregar_config
 from anp.erros import ErroPipeline, ErroQualidade
@@ -57,8 +58,20 @@ def executar(
 
     conexao = conectar(cfg)
     try:
-        carregar(cfg, df, conexao=conexao)
-        resultados = executar_testes(conexao, cfg, semana=semana_alvo)
+        if cfg.backend == "postgres":
+            # O DDL e um passo explicito, uma vez por execucao: abrir a conexao
+            # nao o aplica (no DAG, e a task inicializar_banco).
+            carregar_postgres.aplicar_ddl(conexao)
+            # Staging -> qualidade -> mart: o mart so muda se a qualidade aprovar.
+            # Cada passo e uma funcao isolada, ligada as outras so pelo id_carga.
+            id_carga = carregar_postgres.carregar_staging(cfg, df, conexao)
+            resultados = carregar_postgres.validar(cfg, conexao, id_carga, semana=semana_alvo)
+            carregar_postgres.promover(conexao, id_carga, resultados)
+        else:
+            # DuckDB: carga direta no mart e qualidade depois. O alinhamento com o
+            # fluxo do PostgreSQL fica para a migracao ao Airflow (ver README).
+            carregar(cfg, df, conexao=conexao)
+            resultados = executar_testes(conexao, cfg, semana=semana_alvo)
     finally:
         conexao.close()
 

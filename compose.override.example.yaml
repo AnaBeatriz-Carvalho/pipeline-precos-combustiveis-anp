@@ -1,0 +1,18 @@
+# Publica o Postgres do Compose no host, so na interface local.
+#
+# Por padrao o Postgres nao tem porta publicada. Para consultar o banco com um
+# cliente do Windows ou rodar os testes @pytest.mark.postgres contra ele:
+#
+#   cp compose.override.example.yaml compose.override.yaml
+#   docker compose up -d
+#
+# O Compose carrega compose.override.yaml automaticamente quando ele existe
+# ao lado do docker-compose.yaml. Por isso este arquivo e versionado como
+# .example e o compose.override.yaml fica no .gitignore: sem copia, sem porta.
+#
+# A porta padrao e 15432, fora da faixa 543x que costuma estar ocupada por
+# Postgres instalados no proprio Windows. Mude com ANP_PG_PORTA_LOCAL no .env.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${ANP_PG_PORTA_LOCAL:-15432}:5432"

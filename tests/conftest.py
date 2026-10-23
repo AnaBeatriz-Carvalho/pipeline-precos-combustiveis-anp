@@ -12,7 +12,22 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from anp.config import carregar_config  # noqa: E402
+from anp.config import RAIZ_PROJETO, carregar_config  # noqa: E402
+
+
+def pytest_collection_modifyitems(config, items):
+    """Pula os testes @pytest.mark.postgres quando nao ha DATABASE_URL."""
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv(RAIZ_PROJETO / ".env", override=False)
+    if os.environ.get("DATABASE_URL", "").strip():
+        return
+    pular = pytest.mark.skip(reason="DATABASE_URL nao definida")
+    for item in items:
+        if "postgres" in item.keywords:
+            item.add_marker(pular)
 
 COLUNAS_ANP = [
     "DATA INICIAL",
